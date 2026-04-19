@@ -16,7 +16,7 @@ def generate_sequence_data(num_samples=1000, seq_length=20, F=1, C=1):
     """
     Generate sequences of spikes for training.
     Input: [seq_length, F] random binary sequences
-    Target: [seq_length, C] random binary sequences (for general sequence learning)
+    Target: [C] random binary vector (single output per sequence)
     """
     inputs = []
     targets = []
@@ -26,9 +26,9 @@ def generate_sequence_data(num_samples=1000, seq_length=20, F=1, C=1):
         inp_seq = torch.randint(0, 2, (seq_length, F)).float()
         inputs.append(inp_seq)
 
-        # Random binary target sequence [seq_length, C]
-        tgt_seq = torch.randint(0, 2, (seq_length, C)).float()
-        targets.append(tgt_seq)
+        # Random binary target vector [C]
+        tgt_vec = torch.randint(0, 2, (C,)).float()
+        targets.append(tgt_vec)
 
     return torch.stack(inputs), torch.stack(targets)
 
@@ -63,8 +63,6 @@ class SequenceSNN(nn.Module):
         mem_rec = self.lif_rec.init_leaky()
         mem_out = self.lif_out.init_leaky()
 
-        outputs = []
-
         for t in range(time_steps):
             # Input at time t
             x_t = x[:, t, :]  # [batch, input_size]
@@ -81,13 +79,11 @@ class SequenceSNN(nn.Module):
             # Recurrent layer
             spk, mem_rec = self.lif_rec(total_in, mem_rec)
 
-            # Output layer
-            cur_out = self.fc_out(spk)
-            spk_out, mem_out = self.lif_out(cur_out, mem_out)
+        # Final output after processing the entire sequence
+        cur_out = self.fc_out(spk)
+        spk_out, mem_out = self.lif_out(cur_out, mem_out)
 
-            outputs.append(mem_out)
-
-        return torch.stack(outputs, dim=1)  # [batch, time, output_size]
+        return mem_out  # [batch, output_size]
 
 # -----------------------------
 # Training function
@@ -170,7 +166,7 @@ if __name__ == "__main__":
     SEQ_LEN = 20
     NUM_SAMPLES_TRAIN = 500
     NUM_SAMPLES_TEST = 100
-    EPOCHS = 50
+    EPOCHS = 1000
     LR = 1e-3
 
     # Generate data
@@ -202,11 +198,5 @@ if __name__ == "__main__":
     # Test model
     print("Testing model...")
     predictions, pred_binary = test_model(model, test_inputs, test_targets)
-
-    # Visualize results
-    print("Plotting results...")
-    plot_sequences(test_inputs, test_targets, predictions, num_examples=3)
-
-    plt.show()  # Commented out for headless execution
 
     print("Done!")

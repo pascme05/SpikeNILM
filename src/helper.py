@@ -89,16 +89,18 @@ def preprocess(i, v):
 # -----------------------------
 # Visualization
 # -----------------------------
-def plot_sequences(inputs, targets, predictions, num_examples=3):
-    fig, axes = plt.subplots(num_examples, 1, figsize=(12, 8))
+def plot_sequences(inputs, targets, predictions):
+    fig, axes = plt.subplots(targets.shape[1], 1, figsize=(12, 8))
 
-    for i in range(num_examples):
-        ax = axes[i]
-        time_steps = len(inputs[i])
+    for i in range(0, targets.shape[1]):
+        if targets.shape[1] == 1:
+            ax = axes
+        else:
+            ax = axes[i]
+        time_steps = targets.shape[0]
 
-        ax.plot(range(time_steps), inputs[i, :, 0].numpy(), label='Input (feature 0)', marker='o', linestyle='--')
-        ax.plot(range(time_steps), targets[i, :, 0].numpy(), label='Target (channel 0)', marker='s', linestyle='-')
-        ax.plot(range(time_steps), predictions[i, :, 0].numpy(), label='Prediction (channel 0)', marker='^', linestyle='-.')
+        ax.plot(range(time_steps), targets[:, i].numpy(), label='Target', marker='s', linestyle='-')
+        ax.plot(range(time_steps), predictions[:, i].numpy(), label='Prediction', marker='^', linestyle='-.')
 
         ax.set_title(f'Example {i+1}')
         ax.set_xlabel('Time Step')

@@ -35,8 +35,6 @@ class NILM_SNN(nn.Module):
         mem_rec = self.lif_rec.init_leaky()
         mem_out = self.lif_out.init_leaky()
 
-        outputs = []
-
         for t in range(time_steps):
             # Input at time t
             x_t = x[:, t, :]  # [batch, input_size]
@@ -53,34 +51,49 @@ class NILM_SNN(nn.Module):
             # Recurrent layer
             spk, mem_rec = self.lif_rec(total_in, mem_rec)
 
-            # Output layer
-            cur_out = self.fc_out(spk)
-            spk_out, mem_out = self.lif_out(cur_out, mem_out)
+        # Final output after processing the entire sequence
+        cur_out = self.fc_out(spk)
+        spk_out, mem_out = self.lif_out(cur_out, mem_out)
 
-            outputs.append(mem_out)
-
-        return torch.stack(outputs, dim=1)  # [batch, time, output_size]
-    
+        return mem_out  # [batch, output_size]
 
 # -----------------------------
 # Training function
 # -----------------------------
-def train_model(model, inputs, targets, epochs=500, lr=0.01):
+def train_model(model, inputs, targets, epochs=500, lr=0.01, device=None):
+    # ---------------------------------
+    # Device handling
+    # ---------------------------------
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Using device: {device}")
+
+    model = model.to(device)
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()  # For multi-channel binary classification
+    criterion = nn.BCEWithLogitsLoss()
 
     losses = []
 
     for epoch in range(epochs):
         model.train()
 
+        # ---------------------------------
         # Forward pass
-        outputs = model(inputs)  # inputs is [batch, seq_len, F]
+        # ---------------------------------
+        outputs = model(inputs)
 
-        # Compute loss
-        loss = criterion(outputs, targets)
+        # ensure same shape (important!)
+        targets_ = targets.float()
 
+        loss = criterion(outputs, targets_)
+
+        # ---------------------------------
         # Backward pass
+        # ---------------------------------
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

@@ -14,18 +14,18 @@ from snnNet import NILM_SNN, train_model, test_model
 # -----------------------------
 if __name__ == "__main__":
     # Config
-    DEVICE_ID = 0          
+    DEVICE_ID = 5          
     POWER_THRESHOLD = 50.0 
     TRAIN_SPLIT = 0.8
     HIDDEN_SIZE = 32
-    EPOCHS = 50
+    EPOCHS = 500
     LR = 1e-3
 
     # Load data
-    X, Y = load_data("data/redd3HF.mat")
+    X, Y = load_data("data/redd3HF.mat", maxLen=50000)
 
     # Prepare dataset
-    x, y = prepare_dataset(X, Y, DEVICE_ID)
+    x, y = prepare_dataset(X, Y, thres=POWER_THRESHOLD, device_id=DEVICE_ID)
     W, F = x.shape[1], x.shape[2]
     C = 1
 
@@ -55,7 +55,7 @@ if __name__ == "__main__":
 
     # Visualize results
     print("Plotting results...")
-    plot_sequences(x_test, y_test, predictions, num_examples=3)
+    plot_sequences(x_test, y_test, predictions)
     plt.show()  
 
     print("Done!")
