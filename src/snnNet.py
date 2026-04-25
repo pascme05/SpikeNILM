@@ -1,124 +1,119 @@
 import torch
 import torch.nn as nn
 import snntorch as snn
-from snntorch import surrogate
 
 
-# -----------------------------
-# Network Class
-# -----------------------------
-class NILM_SNN(nn.Module):
-    def __init__(self, input_size=1, hidden_size=32, output_size=1):
+class SpikingNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, beta=0.95, num_layers=2):
         super().__init__()
+        self.num_layers = num_layers
+        layers = []
 
-        spike_grad = surrogate.fast_sigmoid()
+        for layer_index in range(num_layers):
+            in_features = input_size if layer_index == 0 else hidden_size
+            out_features = output_size if layer_index == num_layers - 1 else hidden_size
+            layers.append(nn.Linear(in_features, out_features))
+            layers.append(snn.Leaky(beta=beta, learn_beta=True, learn_threshold=True))
 
-        # Input to hidden
-        self.fc_in = nn.Linear(input_size, hidden_size)
-
-        # Recurrent layer for temporal processing
-        self.lif_rec = snn.Leaky(beta=0.9, spike_grad=spike_grad)
-        self.recurrent = nn.Linear(hidden_size, hidden_size)
-
-        # Hidden to output
-        self.fc_out = nn.Linear(hidden_size, output_size)
-        self.lif_out = snn.Leaky(beta=0.9, spike_grad=spike_grad)
+        self.layers = nn.ModuleList(layers)
 
     def forward(self, x):
-        """
-        x: [batch, time, input_size]
-        returns: [batch, time, output_size]
-        """
-        batch_size, time_steps, _ = x.shape
+        num_steps = x.size(0)
+        membranes = []
+        for layer_index in range(self.num_layers):
+            lif = self.layers[2 * layer_index + 1]
+            membranes.append(lif.init_leaky())
 
-        # Initialize states
-        mem_rec = self.lif_rec.init_leaky()
-        mem_out = self.lif_out.init_leaky()
+        spike_record = []
+        membrane_record = []
 
-        for t in range(time_steps):
-            # Input at time t
-            x_t = x[:, t, :]  # [batch, input_size]
+        for step in range(num_steps):
+            current = x[step]
+            for layer_index in range(self.num_layers):
+                linear = self.layers[2 * layer_index]
+                lif = self.layers[2 * layer_index + 1]
+                current = linear(current)
+                spikes, membranes[layer_index] = lif(current, membranes[layer_index])
+                current = spikes
+            spike_record.append(spikes)
+            membrane_record.append(membranes[-1])
 
-            # Input to hidden
-            hidden_in = self.fc_in(x_t)
+        return torch.stack(spike_record), torch.stack(membrane_record)
 
-            # Recurrent input
-            rec_in = self.recurrent(spk) if t > 0 else torch.zeros_like(hidden_in)
 
-            # Total input
-            total_in = hidden_in + rec_in
+class ConvNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, kernel_size=5):
+        super().__init__()
+        blocks = []
 
-            # Recurrent layer
-            spk, mem_rec = self.lif_rec(total_in, mem_rec)
+        for layer_index in range(num_layers):
+            in_channels = input_size if layer_index == 0 else hidden_size
+            blocks.append(
+                nn.Conv1d(in_channels, hidden_size, kernel_size=kernel_size, padding=kernel_size // 2)
+            )
+            blocks.append(nn.BatchNorm1d(hidden_size))
+            blocks.append(nn.ReLU())
 
-        # Final output after processing the entire sequence
-        cur_out = self.fc_out(spk)
-        spk_out, mem_out = self.lif_out(cur_out, mem_out)
+        self.convs = nn.Sequential(*blocks)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-        return mem_out  # [batch, output_size]
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.convs(x)
+        x = self.pool(x).squeeze(-1)
+        return self.fc(x)
 
-# -----------------------------
-# Training function
-# -----------------------------
-def train_model(model, inputs, targets, epochs=500, lr=0.01, device=None):
-    # ---------------------------------
-    # Device handling
-    # ---------------------------------
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Using device: {device}")
+class LSTMNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.fc = nn.Linear(hidden_size, output_size)
 
-    model = model.to(device)
-    inputs = inputs.to(device)
-    targets = targets.to(device)
+    def forward(self, x):
+        output, _ = self.lstm(x)
+        return self.fc(output[:, -1, :])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
 
-    losses = []
-
-    for epoch in range(epochs):
-        model.train()
-
-        # ---------------------------------
-        # Forward pass
-        # ---------------------------------
-        outputs = model(inputs)
-
-        # ensure same shape (important!)
-        targets_ = targets.float()
-
-        loss = criterion(outputs, targets_)
-
-        # ---------------------------------
-        # Backward pass
-        # ---------------------------------
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        losses.append(loss.item())
-
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}")
-
-    return losses
-
-# -----------------------------
-# Testing function
-# -----------------------------
-def test_model(model, test_inputs, test_targets):
-    model.eval()
-    with torch.no_grad():
-        outputs = model(test_inputs)  # test_inputs is [batch, seq_len, F]
-        predictions = outputs  # [batch, seq_len, C]
-
-        # Calculate accuracy (spike prediction accuracy)
-        pred_binary = (predictions > 0.5).float()
-        accuracy = (pred_binary == test_targets).float().mean().item()
-
-        print(f"Test Accuracy: {accuracy:.4f}")
-
-        return predictions, pred_binary
-    
+def build_model(
+    model_type,
+    input_size,
+    hidden_size,
+    output_size,
+    beta=0.95,
+    num_layers=2,
+    kernel_size=5,
+    dropout=0.2,
+):
+    if model_type == "snn":
+        return SpikingNet(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            output_size=output_size,
+            beta=beta,
+            num_layers=num_layers,
+        )
+    if model_type == "cnn":
+        return ConvNet(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            output_size=output_size,
+            num_layers=num_layers,
+            kernel_size=kernel_size,
+        )
+    if model_type == "lstm":
+        return LSTMNet(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            output_size=output_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+    raise ValueError(f"Unknown MODEL_TYPE: {model_type}. Use 'snn', 'cnn', or 'lstm'.")

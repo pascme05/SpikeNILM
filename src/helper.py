@@ -1,144 +1,137 @@
-import torch
-import math
 import numpy as np
+import torch
 from scipy.io import loadmat
-import matplotlib.pyplot as plt
+from snntorch import spikegen
 
 
-# -----------------------------
-# Load .mat data
-# -----------------------------
-def load_data(mat_file, maxLen=10000):
+def load_data(mat_file, ID=0, maxLen=10000):
     data = loadmat(mat_file)
+    X = data["input"]
+    Y = data["output"]
 
-    X = data["input"]  # [Nt, 2+W, F]
-    Y = data["output"]  # [Nt, D]
+    if maxLen is not None and maxLen > 0:
+        X = X[:maxLen]
+        Y = Y[:maxLen]
 
-    return X[:maxLen], Y[:maxLen]
-
-
-# -----------------------------
-# Convert to tensors
-# -----------------------------
-def prepare_dataset(X, Y, thres=50.0, device_id=0):
-    Nt, total_len, F = X.shape
-    W = total_len - 2
-
-    # Extract waveform
-    signal = X[:, 2:, :]  # [Nt, W, 2]
-
-    i = signal[:, :, 1]
-    v = signal[:, :, 0]
-
-    # Preprocess → [Nt, W, 3]
-    x = preprocess(torch.tensor(i), torch.tensor(v))
-
-    # Select device power
-    power = Y[:, 1 + device_id]  # [Nt]
-
-    # Spike encoding input
-    x = harmonic_spike_encoding(x)
-
-    # Convert to spikes output
-    y = (power > thres).astype(np.float32)
-    y = torch.tensor(y).unsqueeze(1)  # [Nt, 1]
-
-    return x.float(), y.float()
+    X = X[:, 2:277, :]
+    Y = Y[:, 1 + ID]
+    return X, Y
 
 
-# -----------------------------
-# Create sequences of windows
-# -----------------------------
-def create_sequences(x, y, seq_len=20):
-    xs, ys = [], []
+def load_data_multi(mat_file, device_ids, maxLen=-1):
+    """Load X and Y for multiple device IDs in a single file read.
 
-    for i in range(len(x) - seq_len):
-        xs.append(x[i:i+seq_len])
-        ys.append(y[i:i+seq_len])
-
-    return torch.stack(xs), torch.stack(ys)
-
-
-# -----------------------------
-# Split dataset
-# -----------------------------
-def train_test_split(x, y, split=0.8):
-    N = len(x)
-    idx = int(N * split)
-
-    return x[:idx], y[:idx], x[idx:], y[idx:]
-
-# -----------------------------
-# Pre-processing
-# -----------------------------
-def preprocess(i, v):
+    Returns:
+        X: ndarray [n_samples, 275, 2]
+        Y_devices: dict {device_id: ndarray [n_samples]}
     """
-    i, v: [batch, time]
-    returns: [batch, time, features]
-    """
-    # normalize per cycle
-    i = i / (i.abs().max(dim=1, keepdim=True)[0] + 1e-6)
-    v = v / (v.abs().max(dim=1, keepdim=True)[0] + 1e-6)
+    data = loadmat(mat_file)
+    X = data["input"]
+    Y_all = data["output"]
 
-    # instantaneous power
-    p = i * v
+    if maxLen is not None and maxLen > 0:
+        X = X[:maxLen]
+        Y_all = Y_all[:maxLen]
 
-    x = torch.stack([i, v, p], dim=2)
-    return x
+    X = X[:, 2:277, :]
+    Y_devices = {dev_id: Y_all[:, 1 + dev_id] for dev_id in device_ids}
+    return X, Y_devices
 
-# -----------------------------
-# Visualization
-# -----------------------------
-def plot_sequences(inputs, targets, predictions):
-    fig, axes = plt.subplots(targets.shape[1], 1, figsize=(12, 8))
 
-    for i in range(0, targets.shape[1]):
-        if targets.shape[1] == 1:
-            ax = axes
-        else:
-            ax = axes[i]
-        time_steps = targets.shape[0]
+def extract_features(X, n_harmonics=15):
+    V = X[:, :, 0]
+    I = X[:, :, 1]
 
-        ax.plot(range(time_steps), targets[:, i].numpy(), label='Target', marker='s', linestyle='-')
-        ax.plot(range(time_steps), predictions[:, i].numpy(), label='Prediction', marker='^', linestyle='-.')
+    V_fft = np.abs(np.fft.rfft(V, axis=1))[:, 1:n_harmonics + 1]
+    I_fft = np.abs(np.fft.rfft(I, axis=1))[:, 1:n_harmonics + 1]
 
-        ax.set_title(f'Example {i+1}')
-        ax.set_xlabel('Time Step')
-        ax.set_ylabel('Spike')
-        ax.legend()
-        ax.grid(True)
+    rms_v = np.sqrt(np.mean(V ** 2, axis=1, keepdims=True))
+    rms_i = np.sqrt(np.mean(I ** 2, axis=1, keepdims=True))
+    peak_v = np.max(np.abs(V), axis=1, keepdims=True)
+    peak_i = np.max(np.abs(I), axis=1, keepdims=True)
+    real_power = np.mean(V * I, axis=1, keepdims=True)
+    apparent_power = rms_v * rms_i
 
-    plt.tight_layout()
+    return np.concatenate(
+        [V_fft, I_fft, rms_v, rms_i, peak_v, peak_i, real_power, apparent_power],
+        axis=1,
+    ).astype(np.float32)
 
-# -----------------------------
-# Harmonic Spike Encoding
-# -----------------------------
-def harmonic_spike_encoding(x, num_harmonics=8, base_freq=60, fs=16500, threshold=0.2):
-    """
-    x: [batch, time, features]  (i, v, p)
-    returns: [batch, time, spike_features]
-    """
-    batch, T, F = x.shape
-    device = x.device
 
-    t = torch.arange(T, device=device) / fs
-    spikes = []
+def prepare_input(X_flat, n_samples):
+    X_flat = X_flat.reshape(n_samples, -1).astype(np.float32)
+    x_min = X_flat.min(axis=0, keepdims=True)
+    x_max = X_flat.max(axis=0, keepdims=True)
+    return (X_flat - x_min) / (x_max - x_min + 1e-8)
 
-    for k in range(1, num_harmonics + 1):
-        freq = k * base_freq
 
-        cos_wave = torch.cos(2 * math.pi * freq * t).view(1, T, 1)
-        sin_wave = torch.sin(2 * math.pi * freq * t).view(1, T, 1)
+def create_sequences(X, Y, seq_len, stride=1):
+    X_seq = np.lib.stride_tricks.sliding_window_view(X, seq_len, axis=0)
+    X_seq = np.moveaxis(X_seq, -1, 1)
+    Y_seq = Y[seq_len - 1:]
+    return X_seq[::stride].copy(), Y_seq[::stride].copy()
 
-        real = x * cos_wave
-        imag = x * sin_wave
 
-        energy = torch.sqrt(real**2 + imag**2)
+def balance_sequences(X_seq, Y_seq, rng_seed=42):
+    rng = np.random.default_rng(rng_seed)
+    classes, counts = np.unique(Y_seq, return_counts=True)
+    min_count = counts.min()
+    selected = []
 
-        # normalize per sample
-        energy = energy / (energy.amax(dim=1, keepdim=True) + 1e-6)
+    for class_id in classes:
+        class_indices = np.where(Y_seq == class_id)[0]
+        selected.append(rng.choice(class_indices, size=min_count, replace=False))
 
-        spike = (energy > threshold).float()
-        spikes.append(spike)
+    indices = np.sort(np.concatenate(selected))
+    return X_seq[indices], Y_seq[indices]
 
-    return torch.cat(spikes, dim=2)
+
+def encode_spikes(X_batch, coding, device):
+    batch_size, seq_len, feature_count = X_batch.shape
+
+    if coding == "rate":
+        spike_input = spikegen.rate(X_batch.reshape(batch_size * seq_len, feature_count), num_steps=1)
+        spike_input = spike_input.squeeze(0).reshape(batch_size, seq_len, feature_count).permute(1, 0, 2)
+    elif coding == "latency":
+        spike_input = spikegen.latency(
+            X_batch.permute(1, 0, 2),
+            num_steps=seq_len,
+            tau=5.0,
+            threshold=0.01,
+            normalize=True,
+            linear=True,
+        )
+    elif coding == "delta":
+        spike_input = spikegen.delta(X_batch.permute(1, 0, 2), threshold=0.1, off_spike=True)
+    elif coding == "raw":
+        spike_input = X_batch.permute(1, 0, 2)
+    else:
+        raise ValueError(f"Unknown coding: {coding}. Use 'rate', 'latency', 'delta', or 'raw'.")
+
+    return spike_input.to(device)
+
+
+def build_target_spikes(labels, num_steps, num_classes, on_rate, off_rate):
+    batch_size = labels.size(0)
+    targets = torch.zeros(num_steps, batch_size, num_classes, device=labels.device)
+    on_pattern, _ = spikegen.target_rate_code(num_steps=num_steps, rate=on_rate)
+    off_pattern, _ = spikegen.target_rate_code(num_steps=num_steps, rate=off_rate)
+    on_pattern = on_pattern.to(labels.device)
+    off_pattern = off_pattern.to(labels.device)
+
+    for class_id in range(num_classes):
+        mask = labels == class_id
+        targets[:, mask, class_id] = on_pattern.unsqueeze(1)
+        targets[:, ~mask, class_id] = off_pattern.unsqueeze(1)
+
+    return targets
+
+
+def snn_predict(spk_rec, mem_rec, eval_mode):
+    if eval_mode == "membrane":
+        return mem_rec.mean(dim=0).argmax(dim=1)
+    if eval_mode == "spike_count":
+        return spk_rec.sum(dim=0).argmax(dim=1)
+    if eval_mode == "spike_any":
+        return (spk_rec.sum(dim=0)[:, 1] > 0).long()
+    raise ValueError(f"Unknown SNN_EVAL_MODE: {eval_mode}")
