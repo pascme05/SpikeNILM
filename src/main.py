@@ -73,7 +73,6 @@ from helper import (
     encode_spikes,
     extract_features,
     load_data_multi,
-    prepare_input,
     snn_predict,
 )
 from snnNet import build_model
@@ -94,15 +93,17 @@ def build_config():
     return {
         # ── Dataset ──────────────────────────────────────────────────────────
         "NAME": "redd3HF",                                                      # Dataset name
-        "DEVICE_IDS": [5, 7],                                                   # Appliance device IDs to model (one SNN per ID)
+        "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID)
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
-        "SPLIT": 0.80,                                                          # Fraction of samples used for training
-        "MAX_LEN": 100000,                                                      # Max AC cycles to load  (-1 = full dataset)
+        "SPLIT": 0.95,                                                          # Fraction of samples used for training
+        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 15,                                                      # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
+        "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
+        "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
         "USE_DERIVATIVE": False,                                                # True = predict state changes;  False = predict ON/OFF
         "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
-        "STRIDE": 10,                                                           # Sliding-window stride used during training
+        "STRIDE": 5,                                                            # Sliding-window stride used during training
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "MODEL_TYPE": "snn",                                                    # Classifier type: 'snn' | 'cnn' | 'lstm'
@@ -131,9 +132,9 @@ def build_config():
         # ── Regression stage ──────────────────────────────────────────────────
         "DO_REGRESSION": True,                                                  # Enable Stage-3 power regression
         "REGRESSOR_TYPE": "lstm",                                               # Regressor architecture: 'cnn' | 'lstm'
-        "REG_USE_SNN_INPUT": True,                                             # True = features + SNN spikes;  False = features only
+        "REG_USE_SNN_INPUT": True,                                              # True = features + SNN spikes;  False = features only
         "DO_TRAIN_REGRESSOR": True,                                             # True = train;  False = load from checkpoint
-        "REGRESSOR_EPOCHS": 30,                                                 # Number of training epochs for the regressor
+        "REGRESSOR_EPOCHS": 50,                                                 # Number of training epochs for the regressor
         "REGRESSOR_LR": 1e-3,                                                   # Learning rate for the regressor
         "REG_HIDDEN_SIZE": 64,                                                  # Hidden layer width for the regressor
         "REG_NUM_LAYERS": 2,                                                    # Number of stacked layers for the regressor
@@ -146,6 +147,38 @@ def build_config():
         "PLOT_SNN": True,                                                       # Generate per-device SNN classification plots
         "PLOT_REGRESSION": True,                                                # Generate per-device regression plots
     }
+
+
+def fit_normalizer(data, mode):
+    """Fit a per-feature normaliser on the first axis of `data`."""
+    mode = mode.lower()
+    if mode == "none":
+        offset = np.zeros((1, data.shape[1]), dtype=np.float32)
+        scale = np.ones((1, data.shape[1]), dtype=np.float32)
+    elif mode == "0-1":
+        offset = data.min(axis=0, keepdims=True)
+        scale = data.max(axis=0, keepdims=True) - offset
+    elif mode == "mean/std":
+        offset = data.mean(axis=0, keepdims=True)
+        scale = data.std(axis=0, keepdims=True)
+    else:
+        raise ValueError(f"Unknown normalisation mode: {mode}. Use 'none', '0-1' or 'mean/std'.")
+
+    return {
+        "mode": mode,
+        "offset": offset.astype(np.float32, copy=False),
+        "scale": (scale.astype(np.float32, copy=False) + 1e-8),
+    }
+
+
+def apply_normalizer(data, normalizer):
+    """Apply a fitted normaliser to a numpy array."""
+    return ((data - normalizer["offset"]) / normalizer["scale"]).astype(np.float32, copy=False)
+
+
+def denormalize_array(data, normalizer):
+    """Invert a fitted normaliser on a numpy array."""
+    return (data * normalizer["scale"] + normalizer["offset"]).astype(np.float32, copy=False)
 
 
 
@@ -176,25 +209,24 @@ def prepare_shared_features(config):
     X_raw, _ = load_data_multi(f"data/{config['NAME']}.mat", config["DEVICE_IDS"], maxLen=config["MAX_LEN"])
     n_samples = X_raw.shape[0]
 
+    split_idx_raw = int(n_samples * config["SPLIT"])
+
     if config["USE_FEATURES"]:
         # Compute compact spectral + statistical feature vectors
         X_processed = extract_features(X_raw, n_harmonics=config["N_HARMONICS"])
         input_size = X_processed.shape[1]
-        # Min-max normalisation per feature dimension to [0, 1]
-        x_min = X_processed.min(axis=0, keepdims=True)
-        x_max = X_processed.max(axis=0, keepdims=True)
-        X_norm = (X_processed - x_min) / (x_max - x_min + 1e-8)
         print(
             f"Samples: {n_samples}, Features per cycle: {input_size} "
             f"({config['N_HARMONICS']} V-harmonics + {config['N_HARMONICS']} I-harmonics + 6 power features)"
         )
     else:
-        # Flatten the raw V/I waveform and normalise
-        X_norm = prepare_input(X_raw, n_samples)
-        input_size = X_norm.shape[1]
+        # Flatten the raw V/I waveform before normalisation
+        X_processed = X_raw.reshape(n_samples, -1).astype(np.float32)
+        input_size = X_processed.shape[1]
         print(f"Samples: {n_samples}, Raw input size: {input_size}")
 
-    split_idx_raw = int(n_samples * config["SPLIT"])
+    input_normalizer = fit_normalizer(X_processed[:split_idx_raw], config["INPUT_NORM"])
+    X_norm = apply_normalizer(X_processed, input_normalizer)
     seq_len = config["SEQ_LEN"]
 
     # Build sliding-window sequences from the feature matrix.
@@ -208,6 +240,7 @@ def prepare_shared_features(config):
     return {
         "X_norm": X_norm,
         "input_size": input_size,
+        "input_normalizer": input_normalizer,
         "n_samples": n_samples,
         "split_idx_raw": split_idx_raw,
         "X_train_t_reg": torch.tensor(X_train_seq, dtype=torch.float32),
@@ -642,6 +675,8 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id):
     """
     # ── Plot 1: predicted vs true class over time ─────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 4))
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
     ax.plot(all_true, label=f"True ({'/'.join(data_info['class_names'])})", alpha=0.7, linewidth=0.8)
     ax.plot(
         all_preds,
@@ -658,7 +693,7 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id):
     )
     ax.legend()
     plt.tight_layout()
-    plt.savefig(f"pred_vs_true_dev{device_id}.png", dpi=150)
+    plt.savefig(results_dir / f"pred_vs_true_dev{device_id}.png", dpi=150)
     plt.show()
 
     # ── Plot 2: raw power with predicted ON regions shaded ────────────────────
@@ -685,10 +720,12 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id):
     ax.set_title(f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - Predicted ON Regions vs True Power")
     ax.legend()
     plt.tight_layout()
-    plt.savefig(f"power_vs_pred_dev{device_id}.png", dpi=150)
+    plt.savefig(results_dir / f"power_vs_pred_dev{device_id}.png", dpi=150)
     plt.show()
 
     # ── Plot 3: confusion matrix ───────────────────────────────────────────────
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
     fig, ax = plt.subplots(figsize=(5, 4))
     im = ax.imshow(cm, cmap="Blues")
     ax.set_xticks([0, 1])
@@ -708,7 +745,7 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id):
             )
     plt.colorbar(im)
     plt.tight_layout()
-    plt.savefig(f"confusion_matrix_dev{device_id}.png", dpi=150)
+    plt.savefig(results_dir / f"confusion_matrix_dev{device_id}.png", dpi=150)
     plt.show()
 
 
@@ -745,6 +782,10 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
     # Stack per-device power values → [n_samples, n_devices]
     Y_train_power = torch.stack([di["Y_train_power_t"] for di in device_infos], dim=1)
     Y_test_power = torch.stack([di["Y_test_power_t"] for di in device_infos], dim=1)
+
+    target_normalizer = fit_normalizer(Y_train_power.numpy(), config["OUTPUT_NORM"])
+    Y_train_power = torch.from_numpy(apply_normalizer(Y_train_power.numpy(), target_normalizer))
+    Y_test_power = torch.from_numpy(apply_normalizer(Y_test_power.numpy(), target_normalizer))
 
     def extract_all_spikes(X_t):
         """Run every frozen SNN and concatenate their spike outputs.
@@ -798,10 +839,11 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
         "test_loader": test_loader,
         "reg_input_size": reg_input_size,
         "n_devices": n_devices,
+        "target_normalizer": target_normalizer,
     }
 
 
-def eval_regressor(regressor, loader, device):
+def eval_regressor(regressor, loader, device, target_normalizer=None):
     """Evaluate the power regressor on a DataLoader.
 
     Returns:
@@ -818,6 +860,10 @@ def eval_regressor(regressor, loader, device):
             all_true.append(Y_batch)
     all_preds = torch.cat(all_preds).numpy()
     all_true = torch.cat(all_true).numpy()
+
+    if target_normalizer is not None:
+        all_preds = denormalize_array(all_preds, target_normalizer)
+        all_true = denormalize_array(all_true, target_normalizer)
 
     # Flatten for global (across-all-devices) metrics
     flat_pred = all_preds.ravel()
@@ -869,6 +915,9 @@ def train_regressor(config, reg_data, device):
     optimizer = torch.optim.Adam(regressor.parameters(), lr=config["REGRESSOR_LR"])
     best_rmse = float("inf")
     best_state = None
+    mdl_dir = Path("mdl")
+    mdl_dir.mkdir(parents=True, exist_ok=True)
+    regressor_save_path = str(mdl_dir / Path(config["REGRESSOR_SAVE_PATH"]).name)
 
     if config["DO_TRAIN_REGRESSOR"]:
         print(
@@ -888,7 +937,12 @@ def train_regressor(config, reg_data, device):
                 epoch_loss += loss.item()
 
             if (epoch + 1) % 5 == 0 or epoch == 0 or epoch + 1 == config["REGRESSOR_EPOCHS"]:
-                reg_metrics, _, _ = eval_regressor(regressor, reg_data["test_loader"], device)
+                reg_metrics, _, _ = eval_regressor(
+                    regressor,
+                    reg_data["test_loader"],
+                    device,
+                    target_normalizer=reg_data["target_normalizer"],
+                )
                 rmse = reg_metrics["rmse"]
                 avg_loss = epoch_loss / len(reg_data["train_loader"])
                 print(
@@ -898,15 +952,15 @@ def train_regressor(config, reg_data, device):
                 if rmse < best_rmse:
                     best_rmse = rmse
                     best_state = deepcopy(regressor.state_dict())
-                    torch.save(best_state, config["REGRESSOR_SAVE_PATH"])
-                    print(f"  -> Saved best regressor ({best_rmse:.2f} W) to {config['REGRESSOR_SAVE_PATH']}")
+                    torch.save(best_state, regressor_save_path)
+                    print(f"  -> Saved best regressor ({best_rmse:.2f} W) to {regressor_save_path}")
 
         print(f"\nBest regressor RMSE: {best_rmse:.2f} W")
     else:
-        if not Path(config["REGRESSOR_SAVE_PATH"]).exists():
-            raise FileNotFoundError(f"Regressor model not found: {config['REGRESSOR_SAVE_PATH']}")
-        best_state = torch.load(config["REGRESSOR_SAVE_PATH"], map_location=device, weights_only=True)
-        print(f"Loaded regressor from {config['REGRESSOR_SAVE_PATH']}")
+        if not Path(regressor_save_path).exists():
+            raise FileNotFoundError(f"Regressor model not found: {regressor_save_path}")
+        best_state = torch.load(regressor_save_path, map_location=device, weights_only=True)
+        print(f"Loaded regressor from {regressor_save_path}")
 
     regressor.load_state_dict(best_state)
     return regressor
@@ -932,6 +986,8 @@ def plot_regression(config, all_pred_power, all_true_power, device_ids):
 
     n_devices = all_pred_power.shape[1]
     input_label = "SNN + features" if config["REG_USE_SNN_INPUT"] else "features only"
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
 
     for i, dev_id in enumerate(device_ids):
         pred = all_pred_power[:, i]
@@ -950,7 +1006,7 @@ def plot_regression(config, all_pred_power, all_true_power, device_ids):
         )
         ax.legend()
         plt.tight_layout()
-        plt.savefig(f"power_regression_dev{dev_id}.png", dpi=150)
+        plt.savefig(results_dir / f"power_regression_dev{dev_id}.png", dpi=150)
         plt.show()
 
         fig, ax = plt.subplots(figsize=(5, 5))
@@ -963,7 +1019,7 @@ def plot_regression(config, all_pred_power, all_true_power, device_ids):
         ax.set_title(f"Device {dev_id} — Regression Scatter")
         ax.legend()
         plt.tight_layout()
-        plt.savefig(f"power_regression_scatter_dev{dev_id}.png", dpi=150)
+        plt.savefig(results_dir / f"power_regression_scatter_dev{dev_id}.png", dpi=150)
         plt.show()
 
 
@@ -997,6 +1053,7 @@ def main():
         f"Model: {config['MODEL_TYPE'].upper()}, Coding: {config['CODING']}, "
         f"Features: {'extracted' if config['USE_FEATURES'] else 'raw'}"
     )
+    print(f"Normalisation - Input: {config['INPUT_NORM']}, Output: {config['OUTPUT_NORM']}")
     print(f"Device IDs: {device_ids}")
     print(f"Target: {'state changes (derivative)' if config['USE_DERIVATIVE'] else 'ON/OFF state'}")
     if config["MODEL_TYPE"] == "snn":
@@ -1012,6 +1069,8 @@ def main():
     # ── Stage 2: per-device SNN training ──────────────────────────────────────
     snn_models = []      # Stores one trained SNN per device (for regression input)
     device_infos = []    # Stores one data_info dict per device
+    mdl_dir = Path("mdl")
+    mdl_dir.mkdir(parents=True, exist_ok=True)
 
     for dev_id in device_ids:
         print(f"\n{'='*55}")
@@ -1023,8 +1082,7 @@ def main():
         device_infos.append(data_info)
 
         hyperparams = build_hyperparams(config)
-        # TODO: Please save under \mdl
-        save_path = config["SNN_SAVE_PATH_TEMPLATE"].format(device_id=dev_id)
+        save_path = str(mdl_dir / config["SNN_SAVE_PATH_TEMPLATE"].format(device_id=dev_id))
 
         # Optional Optuna hyper-parameter search (only when training is enabled)
         if config["USE_OPTUNA"] and config["DO_TRAIN"]:
@@ -1072,7 +1130,10 @@ def main():
 
             # Evaluate and report regression metrics
             reg_metrics, all_pred_power, all_true_power = eval_regressor(
-                regressor, reg_data["test_loader"], device
+                regressor,
+                reg_data["test_loader"],
+                device,
+                target_normalizer=reg_data["target_normalizer"],
             )
             print(f"\n{'─'*50}")
             print(f"REGRESSION REPORT  ({len(device_ids)} device(s))")
