@@ -104,10 +104,13 @@ def build_config():
         "USE_DERIVATIVE": False,                                                # True = predict state changes;  False = predict ON/OFF
         "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
         "STRIDE": 5,                                                            # Sliding-window stride used during training
+        "DEVICE": "auto",                                                       # 'auto' = prefer CUDA, otherwise CPU; can also force 'cuda' or 'cpu'
+        "GPU_INDEX": 0,                                                         # CUDA device index when DEVICE resolves to GPU
+        "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "MODEL_TYPE": "snn",                                                    # Classifier type: 'snn' | 'cnn' | 'lstm'
-        "SEQ_LEN": 100,                                                         # Number of AC cycles per input window
+        "SEQ_LEN": 60,                                                          # Number of AC cycles per input window
         "HIDDEN_SIZE": 64,                                                      # Hidden layer width (neurons / channels)
         "NUM_LAYERS": 2,                                                        # Number of stacked layers
         "BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
@@ -118,7 +121,7 @@ def build_config():
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
         "OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
-        "BATCH_SIZE": 256,                                                      # Mini-batch size for training                                        
+        "BATCH_SIZE": 1024,                                                     # Mini-batch size for training                                        
         "LR": 1e-3,                                                             # Learning rate for Adam optimiser
         "EPOCHS": 50,                                                           # Number of training epochs
         "DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
@@ -134,7 +137,7 @@ def build_config():
         "REGRESSOR_TYPE": "lstm",                                               # Regressor architecture: 'cnn' | 'lstm'
         "REG_USE_SNN_INPUT": True,                                              # True = features + SNN spikes;  False = features only
         "DO_TRAIN_REGRESSOR": True,                                             # True = train;  False = load from checkpoint
-        "REGRESSOR_EPOCHS": 50,                                                 # Number of training epochs for the regressor
+        "REGRESSOR_EPOCHS": 100,                                                # Number of training epochs for the regressor
         "REGRESSOR_LR": 1e-3,                                                   # Learning rate for the regressor
         "REG_HIDDEN_SIZE": 64,                                                  # Hidden layer width for the regressor
         "REG_NUM_LAYERS": 2,                                                    # Number of stacked layers for the regressor
@@ -147,6 +150,67 @@ def build_config():
         "PLOT_SNN": True,                                                       # Generate per-device SNN classification plots
         "PLOT_REGRESSION": True,                                                # Generate per-device regression plots
     }
+
+
+def resolve_device(config):
+    """Resolve the requested compute device and fail loudly on invalid CUDA setups."""
+    requested = str(config.get("DEVICE", "auto")).lower()
+    gpu_index = int(config.get("GPU_INDEX", 0))
+
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"Unknown DEVICE setting: {requested}. Use 'auto', 'cpu', or 'cuda'.")
+
+    if requested == "cpu":
+        return torch.device("cpu")
+
+    if torch.cuda.is_available():
+        if gpu_index >= torch.cuda.device_count():
+            raise ValueError(
+                f"GPU_INDEX={gpu_index} is out of range for {torch.cuda.device_count()} visible CUDA device(s)."
+            )
+        return torch.device(f"cuda:{gpu_index}")
+
+    if requested == "cuda":
+        cuda_build = torch.version.cuda or "CPU-only build"
+        raise RuntimeError(
+            "DEVICE='cuda' was requested, but CUDA is not available in this Python environment. "
+            f"Installed torch: {torch.__version__} ({cuda_build})."
+        )
+
+    return torch.device("cpu")
+
+
+def configure_runtime(device):
+    """Enable CUDA performance settings when a GPU is active."""
+    if device.type != "cuda":
+        return
+
+    torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def build_dataloader(dataset, batch_size, shuffle, config, device):
+    """Create a DataLoader with GPU-friendly host-to-device settings."""
+    num_workers = int(config["NUM_WORKERS"])
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def move_tensor(tensor, device):
+    """Move a tensor to the active device, using async copies on CUDA."""
+    return tensor.to(device, non_blocking=device.type == "cuda")
 
 
 def fit_normalizer(data, mode):
@@ -253,7 +317,7 @@ def prepare_shared_features(config):
 # STAGE 2 – PER-DEVICE DATA PREPARATION & SNN TRAINING
 # =============================================================================
 
-def prepare_device_classification(config, shared, device_id, Y_device):
+def prepare_device_classification(config, shared, device_id, Y_device, device):
     """Build classification DataLoaders and power regression targets for one device.
 
     Steps:
@@ -336,8 +400,20 @@ def prepare_device_classification(config, shared, device_id, Y_device):
     X_test_t = torch.tensor(X_test_seq, dtype=torch.float32)
     Y_test_t = torch.tensor(Y_test_seq, dtype=torch.long)
 
-    train_loader = DataLoader(TensorDataset(X_train_t, Y_train_t), batch_size=config["BATCH_SIZE"], shuffle=True)
-    test_loader = DataLoader(TensorDataset(X_test_t, Y_test_t), batch_size=config["BATCH_SIZE"], shuffle=False)
+    train_loader = build_dataloader(
+        TensorDataset(X_train_t, Y_train_t),
+        batch_size=config["BATCH_SIZE"],
+        shuffle=True,
+        config=config,
+        device=device,
+    )
+    test_loader = build_dataloader(
+        TensorDataset(X_test_t, Y_test_t),
+        batch_size=config["BATCH_SIZE"],
+        shuffle=False,
+        config=config,
+        device=device,
+    )
 
     return {
         "train_loader": train_loader,
@@ -443,8 +519,8 @@ def forward_batch(model, criterion, X_batch, Y_batch, config, data_info, device)
         loss  : scalar loss tensor (with grad)
         preds : [batch] int64 tensor of predicted class indices
     """
-    X_batch = X_batch.to(device)
-    Y_batch = Y_batch.to(device)
+    X_batch = move_tensor(X_batch, device)
+    Y_batch = move_tensor(Y_batch, device)
 
     if config["MODEL_TYPE"] == "snn":
         # Convert raw features to the chosen spike encoding before feeding the SNN
@@ -490,7 +566,7 @@ def predict_loader(model, loader, config, device):
 
     with torch.no_grad():
         for X_batch, Y_batch in loader:
-            X_batch = X_batch.to(device)
+            X_batch = move_tensor(X_batch, device)
             if config["MODEL_TYPE"] == "snn":
                 spike_input = encode_spikes(X_batch, config["CODING"], device)
                 spk_rec, mem_rec = model(spike_input)
@@ -768,10 +844,12 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
             (the power reading at the last AC cycle of the window).
 
     Returns a dict with:
-        train_loader   : DataLoader (shuffled)
-        test_loader    : DataLoader (sequential)
-        reg_input_size : int – feature dimension of the regressor input
-        n_devices      : int – number of appliance outputs
+        train_loader    : DataLoader (shuffled)
+        test_loader     : DataLoader (sequential)
+        reg_input_size  : int – feature dimension of the regressor input
+        n_devices       : int – number of appliance outputs
+        plot_raw_test   : torch.Tensor [n_test, seq_len, raw_feature_dim]
+        plot_spike_test : torch.Tensor | None [n_test, seq_len, spike_dim]
     """
     use_snn = config["REG_USE_SNN_INPUT"] and snn_models is not None and len(snn_models) > 0
     n_devices = len(device_infos)
@@ -794,10 +872,16 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
         Each SNN produces a [seq_len, 2] spike tensor per sample (ON/OFF neurons).
         """
         spike_parts = [[] for _ in snn_models]
-        loader = DataLoader(TensorDataset(X_t), batch_size=config["BATCH_SIZE"], shuffle=False)
+        loader = build_dataloader(
+            TensorDataset(X_t),
+            batch_size=config["BATCH_SIZE"],
+            shuffle=False,
+            config=config,
+            device=device,
+        )
         with torch.no_grad():
             for (X_batch,) in loader:
-                X_batch = X_batch.to(device)
+                X_batch = move_tensor(X_batch, device)
                 spike_input = encode_spikes(X_batch, config["CODING"], device)
                 for i, snn in enumerate(snn_models):
                     spk_rec, _ = snn(spike_input)
@@ -815,6 +899,7 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
         X_test_combined = torch.cat([X_test_t_reg, spk_test], dim=-1)
     else:
         print("Regression using features only (REG_USE_SNN_INPUT=False)...")
+        spk_test = None
         X_train_combined = X_train_t_reg
         X_test_combined = X_test_t_reg
 
@@ -824,15 +909,19 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
         f"train samples: {X_train_combined.shape[0]}, test samples: {X_test_combined.shape[0]}"
     )
 
-    train_loader = DataLoader(
+    train_loader = build_dataloader(
         TensorDataset(X_train_combined, Y_train_power),
         batch_size=config["BATCH_SIZE"],
         shuffle=True,
+        config=config,
+        device=device,
     )
-    test_loader = DataLoader(
+    test_loader = build_dataloader(
         TensorDataset(X_test_combined, Y_test_power),
         batch_size=config["BATCH_SIZE"],
         shuffle=False,
+        config=config,
+        device=device,
     )
     return {
         "train_loader": train_loader,
@@ -840,6 +929,8 @@ def prepare_regression_data(config, snn_models, shared, device_infos, device):
         "reg_input_size": reg_input_size,
         "n_devices": n_devices,
         "target_normalizer": target_normalizer,
+        "plot_raw_test": X_test_t_reg,
+        "plot_spike_test": spk_test,
     }
 
 
@@ -855,7 +946,7 @@ def eval_regressor(regressor, loader, device, target_normalizer=None):
     all_preds, all_true = [], []
     with torch.no_grad():
         for X_batch, Y_batch in loader:
-            preds = regressor(X_batch.to(device)).cpu()   # [batch, n_devices] or [batch, 1]
+            preds = regressor(move_tensor(X_batch, device)).cpu()   # [batch, n_devices] or [batch, 1]
             all_preds.append(preds)
             all_true.append(Y_batch)
     all_preds = torch.cat(all_preds).numpy()
@@ -928,7 +1019,8 @@ def train_regressor(config, reg_data, device):
             regressor.train()
             epoch_loss = 0.0
             for X_batch, Y_batch in reg_data["train_loader"]:
-                X_batch, Y_batch = X_batch.to(device), Y_batch.to(device)
+                X_batch = move_tensor(X_batch, device)
+                Y_batch = move_tensor(Y_batch, device)
                 preds = regressor(X_batch)   # [batch, n_devices]
                 loss = criterion(preds, Y_batch)
                 optimizer.zero_grad()
@@ -1023,6 +1115,69 @@ def plot_regression(config, all_pred_power, all_true_power, device_ids):
         plt.show()
 
 
+def plot_regression_with_inputs(config, reg_data, all_pred_power, all_true_power, device_ids):
+    """Generate regression plots with separate spike/raw input panels above the output."""
+    if all_pred_power.ndim == 1:
+        all_pred_power = all_pred_power[:, None]
+        all_true_power = all_true_power[:, None]
+
+    input_label = "SNN + features" if config["REG_USE_SNN_INPUT"] else "features only"
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    raw_summary = reg_data["plot_raw_test"].mean(dim=1).cpu().numpy().T
+    spike_test = reg_data["plot_spike_test"]
+    spike_summary = None if spike_test is None else spike_test.mean(dim=1).cpu().numpy().T
+    raw_label = "Feature Ch." if config["USE_FEATURES"] else "Raw Input Ch."
+
+    for i, dev_id in enumerate(device_ids):
+        pred = all_pred_power[:, i]
+        true = all_true_power[:, i]
+        rmse = np.sqrt(np.mean((pred - true) ** 2))
+        mae = np.mean(np.abs(pred - true))
+
+        fig, axes = plt.subplots(
+            3, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [1.0, 1.0, 1.6]}
+        )
+        ax_spike, ax_raw, ax_out = axes
+
+        if spike_summary is None:
+            ax_spike.text(0.5, 0.5, "No spike inputs used", ha="center", va="center", transform=ax_spike.transAxes)
+            ax_spike.set_yticks([])
+        else:
+            ax_spike.imshow(spike_summary, aspect="auto", origin="lower", interpolation="nearest", cmap="Greys")
+        ax_spike.set_ylabel("Spike Ch.")
+        ax_spike.set_title(
+            f"Device {dev_id} - {config['REGRESSOR_TYPE'].upper()} Regression ({input_label})  "
+            f"RMSE={rmse:.2f} W  MAE={mae:.2f} W"
+        )
+
+        ax_raw.imshow(raw_summary, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
+        ax_raw.set_ylabel(raw_label)
+
+        ax_out.plot(true, label="True Power (W)", color="steelblue", linewidth=0.8)
+        ax_out.plot(pred, label="Predicted Power (W)", color="tomato", linewidth=0.8, linestyle="--", alpha=0.8)
+        ax_out.set_xlabel("Test Sample Index")
+        ax_out.set_ylabel("Power (W)")
+        ax_out.legend()
+
+        plt.tight_layout()
+        plt.savefig(results_dir / f"power_regression_dev{dev_id}.png", dpi=150)
+        plt.show()
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(true, pred, alpha=0.3, s=5, rasterized=True)
+        lim_min = min(float(true.min()), float(pred.min()))
+        lim_max = max(float(true.max()), float(pred.max()))
+        ax.plot([lim_min, lim_max], [lim_min, lim_max], "k--", linewidth=1, label="Ideal")
+        ax.set_xlabel("True Power (W)")
+        ax.set_ylabel("Predicted Power (W)")
+        ax.set_title(f"Device {dev_id} - Regression Scatter")
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(results_dir / f"power_regression_scatter_dev{dev_id}.png", dpi=150)
+        plt.show()
+
+
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
@@ -1047,8 +1202,18 @@ def main():
     device_ids = config["DEVICE_IDS"]
 
     # ── Hardware & configuration summary ──────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(config)
+    configure_runtime(device)
     print(f"Using device: {device}")
+    print(f"PyTorch: {torch.__version__}  |  CUDA build: {torch.version.cuda or 'CPU-only'}")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        print(f"CUDA device: {gpu_name}  |  VRAM: {total_vram_gb:.1f} GB")
+    elif torch.version.cuda is None:
+        print("CUDA status: current PyTorch build is CPU-only, so GPU acceleration is unavailable.")
+    else:
+        print("CUDA status: this PyTorch build includes CUDA, but no CUDA device is available to the process.")
     print(
         f"Model: {config['MODEL_TYPE'].upper()}, Coding: {config['CODING']}, "
         f"Features: {'extracted' if config['USE_FEATURES'] else 'raw'}"
@@ -1078,7 +1243,7 @@ def main():
         print(f"{'='*55}")
 
         # Prepare per-device classification sequences + power targets
-        data_info = prepare_device_classification(config, shared, dev_id, Y_devices[dev_id])
+        data_info = prepare_device_classification(config, shared, dev_id, Y_devices[dev_id], device)
         device_infos.append(data_info)
 
         hyperparams = build_hyperparams(config)
@@ -1147,7 +1312,7 @@ def main():
 
             # Optionally generate regression plots
             if config["PLOT_REGRESSION"]:
-                plot_regression(config, all_pred_power, all_true_power, device_ids)
+                plot_regression_with_inputs(config, reg_data, all_pred_power, all_true_power, device_ids)
 
 
 if __name__ == "__main__":
