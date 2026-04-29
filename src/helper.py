@@ -38,12 +38,45 @@ def load_data_multi(mat_file, device_ids, maxLen=-1):
     return X, Y_devices
 
 
-def extract_features(X, n_harmonics=15):
+def select_input_channels(X, channels=None):
+    """Select raw waveform channels by name.
+
+    Args:
+        X: ndarray [n_samples, seq_len, 2] with channel order [voltage, current]
+        channels: iterable of 'voltage' and/or 'current'
+    """
+    channel_map = {"voltage": 0, "current": 1}
+    if channels is None:
+        channels = ("voltage", "current")
+
+    indices = []
+    for channel in channels:
+        if channel not in channel_map:
+            raise ValueError(f"Unknown raw input channel: {channel}. Use 'voltage' and/or 'current'.")
+        indices.append(channel_map[channel])
+
+    if not indices:
+        raise ValueError("At least one raw input channel must be selected.")
+
+    return X[:, :, indices].copy()
+
+
+def extract_features(X, n_harmonics=15, selector=None, return_names=False):
+    """Extract configurable spectral/statistical features from voltage/current waveforms."""
+    if selector is None:
+        selector = {
+            "voltage_harmonics": True,
+            "current_harmonics": True,
+            "voltage_stats": True,
+            "current_stats": True,
+            "power_stats": True,
+        }
+
     V = X[:, :, 0]
     I = X[:, :, 1]
 
-    V_fft = np.abs(np.fft.rfft(V, axis=1))[:, 1:n_harmonics + 1]
-    I_fft = np.abs(np.fft.rfft(I, axis=1))[:, 1:n_harmonics + 1]
+    V_fft = np.abs(np.fft.rfft(V, axis=1))[:, 1:n_harmonics + 1] / V.shape[1] * 2
+    I_fft = np.abs(np.fft.rfft(I, axis=1))[:, 1:n_harmonics + 1] / I.shape[1] * 2
 
     rms_v = np.sqrt(np.mean(V ** 2, axis=1, keepdims=True))
     rms_i = np.sqrt(np.mean(I ** 2, axis=1, keepdims=True))
@@ -52,10 +85,32 @@ def extract_features(X, n_harmonics=15):
     real_power = np.mean(V * I, axis=1, keepdims=True)
     apparent_power = rms_v * rms_i
 
-    return np.concatenate(
-        [V_fft, I_fft, rms_v, rms_i, peak_v, peak_i, real_power, apparent_power],
-        axis=1,
-    ).astype(np.float32)
+    feature_blocks = []
+    feature_names = []
+
+    if selector.get("voltage_harmonics", True):
+        feature_blocks.append(V_fft)
+        feature_names.extend([f"V_h{idx}" for idx in range(1, n_harmonics + 1)])
+    if selector.get("current_harmonics", True):
+        feature_blocks.append(I_fft)
+        feature_names.extend([f"I_h{idx}" for idx in range(1, n_harmonics + 1)])
+    if selector.get("voltage_stats", True):
+        feature_blocks.extend([rms_v, peak_v])
+        feature_names.extend(["rms_v", "peak_v"])
+    if selector.get("current_stats", True):
+        feature_blocks.extend([rms_i, peak_i])
+        feature_names.extend(["rms_i", "peak_i"])
+    if selector.get("power_stats", True):
+        feature_blocks.extend([real_power, apparent_power])
+        feature_names.extend(["real_power", "apparent_power"])
+
+    if not feature_blocks:
+        raise ValueError("Feature selector disabled all feature groups. Enable at least one input feature group.")
+
+    features = np.concatenate(feature_blocks, axis=1).astype(np.float32)
+    if return_names:
+        return features, feature_names
+    return features
 
 
 def prepare_input(X_flat, n_samples):

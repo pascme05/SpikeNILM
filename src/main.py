@@ -42,6 +42,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import snntorch.spikeplot as splt
 from sklearn.metrics import (
     balanced_accuracy_score,
     classification_report,
@@ -73,6 +74,7 @@ from helper import (
     encode_spikes,
     extract_features,
     load_data_multi,
+    select_input_channels,
     snn_predict,
 )
 from snnNet import build_model
@@ -97,8 +99,16 @@ def build_config():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT": 0.95,                                                          # Fraction of samples used for training
         "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
-        "N_HARMONICS": 15,                                                      # FFT harmonics extracted per voltage/current channel
+        "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
+        "FEATURE_SELECTOR": {
+            "voltage_harmonics": True,
+            "current_harmonics": True,
+            "voltage_stats": True,
+            "current_stats": True,
+            "power_stats": True,
+        },
+        "RAW_INPUT_CHANNELS": ["voltage", "current"],                           # Raw mode selector: any subset of ['voltage', 'current']
         "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
         "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
         "USE_DERIVATIVE": False,                                                # True = predict state changes;  False = predict ON/OFF
@@ -110,13 +120,13 @@ def build_config():
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "MODEL_TYPE": "snn",                                                    # Classifier type: 'snn' | 'cnn' | 'lstm'
-        "SEQ_LEN": 60,                                                          # Number of AC cycles per input window
+        "SEQ_LEN": 100,                                                         # Number of AC cycles per input window
         "HIDDEN_SIZE": 64,                                                      # Hidden layer width (neurons / channels)
-        "NUM_LAYERS": 2,                                                        # Number of stacked layers
+        "NUM_LAYERS": 3,                                                        # Number of stacked layers
         "BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
         "KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
-        "CODING": "raw",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
+        "CODING": "rate",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
         "SNN_LOSS_MODE": "membrane",                                            # Loss target: 'membrane' | 'spike'
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
@@ -149,6 +159,9 @@ def build_config():
         # Disable plots during automated runs (e.g. Optuna sweeps) to save time.
         "PLOT_SNN": True,                                                       # Generate per-device SNN classification plots
         "PLOT_REGRESSION": True,                                                # Generate per-device regression plots
+        "PLOT_DEBUG_BATCH": True,                                              # Plot the first test batch input/output for model debugging
+        "DEBUG_SAMPLE_INDEX": 0,                                                # Sample index inside the debug batch used for detailed views
+        "DEBUG_BATCH_PLOT_SAMPLES": 24,                                         # Max number of batch samples shown in debug heatmaps
     }
 
 
@@ -213,6 +226,11 @@ def move_tensor(tensor, device):
     return tensor.to(device, non_blocking=device.type == "cuda")
 
 
+def resolve_sample_index(config, batch_size):
+    """Clamp the configured sample index to the current batch size."""
+    return min(max(int(config.get("DEBUG_SAMPLE_INDEX", 0)), 0), batch_size - 1)
+
+
 def fit_normalizer(data, mode):
     """Fit a per-feature normaliser on the first axis of `data`."""
     mode = mode.lower()
@@ -245,6 +263,26 @@ def denormalize_array(data, normalizer):
     return (data * normalizer["scale"] + normalizer["offset"]).astype(np.float32, copy=False)
 
 
+def describe_feature_selection(config):
+    """Create a short human-readable summary of the active input selector."""
+    if config["USE_FEATURES"]:
+        selector = config["FEATURE_SELECTOR"]
+        labels = []
+        if selector.get("voltage_harmonics", True):
+            labels.append(f"{config['N_HARMONICS']} V-harmonics")
+        if selector.get("current_harmonics", True):
+            labels.append(f"{config['N_HARMONICS']} I-harmonics")
+        if selector.get("voltage_stats", True):
+            labels.append("2 voltage stats")
+        if selector.get("current_stats", True):
+            labels.append("2 current stats")
+        if selector.get("power_stats", True):
+            labels.append("2 power stats")
+        return ", ".join(labels)
+
+    return ", ".join(config["RAW_INPUT_CHANNELS"])
+
+
 
 # =============================================================================
 # STAGE 1 – SHARED FEATURE EXTRACTION
@@ -257,14 +295,13 @@ def prepare_shared_features(config):
     differs.  We therefore extract features once and reuse them for all devices.
 
     Feature vector per AC cycle (when USE_FEATURES=True):
-        - N_HARMONICS voltage FFT magnitudes
-        - N_HARMONICS current FFT magnitudes
-        - RMS voltage, RMS current, peak voltage, peak current
-        - Real power (mean of V*I), apparent power (RMS_V * RMS_I)
+        - configurable subsets of voltage harmonics, current harmonics,
+          voltage/current statistics, and power statistics
 
     Returns a dict with:
         X_norm        : normalised feature array  [n_samples, input_size]
         input_size    : number of features per cycle
+        feature_names : list[str] describing the active input dimensions
         n_samples     : total number of AC cycles loaded
         split_idx_raw : sample index separating training from test data
         X_train_t_reg : sliding-window sequences tensor (train) for the regressor
@@ -277,17 +314,28 @@ def prepare_shared_features(config):
 
     if config["USE_FEATURES"]:
         # Compute compact spectral + statistical feature vectors
-        X_processed = extract_features(X_raw, n_harmonics=config["N_HARMONICS"])
+        X_processed, feature_names = extract_features(
+            X_raw,
+            n_harmonics=config["N_HARMONICS"],
+            selector=config["FEATURE_SELECTOR"],
+            return_names=True,
+        )
         input_size = X_processed.shape[1]
         print(
             f"Samples: {n_samples}, Features per cycle: {input_size} "
-            f"({config['N_HARMONICS']} V-harmonics + {config['N_HARMONICS']} I-harmonics + 6 power features)"
+            f"({describe_feature_selection(config)})"
         )
     else:
-        # Flatten the raw V/I waveform before normalisation
-        X_processed = X_raw.reshape(n_samples, -1).astype(np.float32)
+        # Select raw waveform channels before flattening
+        X_selected = select_input_channels(X_raw, config["RAW_INPUT_CHANNELS"])
+        X_processed = X_selected.reshape(n_samples, -1).astype(np.float32)
         input_size = X_processed.shape[1]
-        print(f"Samples: {n_samples}, Raw input size: {input_size}")
+        feature_names = [
+            f"{channel}_t{step}"
+            for step in range(X_selected.shape[1])
+            for channel in config["RAW_INPUT_CHANNELS"]
+        ]
+        print(f"Samples: {n_samples}, Raw input size: {input_size} ({describe_feature_selection(config)})")
 
     input_normalizer = fit_normalizer(X_processed[:split_idx_raw], config["INPUT_NORM"])
     X_norm = apply_normalizer(X_processed, input_normalizer)
@@ -304,6 +352,7 @@ def prepare_shared_features(config):
     return {
         "X_norm": X_norm,
         "input_size": input_size,
+        "feature_names": feature_names,
         "input_normalizer": input_normalizer,
         "n_samples": n_samples,
         "split_idx_raw": split_idx_raw,
@@ -552,34 +601,84 @@ def forward_batch(model, criterion, X_batch, Y_batch, config, data_info, device)
     return loss, preds
 
 
-def predict_loader(model, loader, config, device):
+def predict_loader(
+    model,
+    loader,
+    config,
+    device,
+    return_plot_data=False,
+    return_debug_batch=False,
+):
     """Evaluate the model on an entire DataLoader without computing gradients.
 
     Returns:
         accuracy  : float – fraction of correctly classified sequences
         all_preds : ndarray [n_samples] – predicted class indices
         all_true  : ndarray [n_samples] – ground-truth class indices
+        plot_data : dict | None – optional representative sample data for plotting
+        debug_batch : dict | None – optional first-batch debug tensors
     """
     model.eval()
     all_preds = []
     all_true = []
+    plot_data = None
+    debug_batch = None
 
     with torch.no_grad():
         for X_batch, Y_batch in loader:
             X_batch = move_tensor(X_batch, device)
+            sample_index = resolve_sample_index(config, X_batch.size(0))
             if config["MODEL_TYPE"] == "snn":
                 spike_input = encode_spikes(X_batch, config["CODING"], device)
                 spk_rec, mem_rec = model(spike_input)
                 preds = snn_predict(spk_rec, mem_rec, config["SNN_EVAL_MODE"])
+                output_summary = mem_rec.mean(dim=0) if config["SNN_EVAL_MODE"] == "membrane" else spk_rec.sum(dim=0)
+
+                if return_plot_data and plot_data is None:
+                    plot_data = {
+                        "plot_input_sample": X_batch[sample_index].cpu(),
+                        "plot_encoded_input_sample": spike_input[:, sample_index].cpu(),
+                        "plot_output_spikes_sample": spk_rec[:, sample_index].cpu(),
+                        "plot_output_mem_sample": mem_rec[:, sample_index].cpu(),
+                        "plot_true_label": int(Y_batch[sample_index].item()),
+                        "plot_pred_label": int(preds[sample_index].item()),
+                        "plot_sample_index": sample_index,
+                    }
+                if return_debug_batch and debug_batch is None:
+                    debug_batch = {
+                        "input_batch": X_batch.cpu(),
+                        "encoded_input_batch": spike_input.cpu(),
+                        "output_spikes_batch": spk_rec.cpu(),
+                        "output_mem_batch": mem_rec.cpu(),
+                        "output_summary_batch": output_summary.cpu(),
+                        "labels": Y_batch.cpu(),
+                        "preds": preds.cpu(),
+                    }
             else:
-                preds = model(X_batch).argmax(dim=1)
+                logits = model(X_batch)
+                preds = logits.argmax(dim=1)
+                if return_plot_data and plot_data is None:
+                    plot_data = {
+                        "plot_input_sample": X_batch[sample_index].cpu(),
+                        "plot_output_logits_sample": logits[sample_index].cpu(),
+                        "plot_true_label": int(Y_batch[sample_index].item()),
+                        "plot_pred_label": int(preds[sample_index].item()),
+                        "plot_sample_index": sample_index,
+                    }
+                if return_debug_batch and debug_batch is None:
+                    debug_batch = {
+                        "input_batch": X_batch.cpu(),
+                        "output_logits_batch": logits.cpu(),
+                        "labels": Y_batch.cpu(),
+                        "preds": preds.cpu(),
+                    }
             all_preds.append(preds.cpu().numpy())
             all_true.append(Y_batch.numpy())
 
     all_preds = np.concatenate(all_preds)
     all_true = np.concatenate(all_true)
     accuracy = (all_preds == all_true).mean()
-    return accuracy, all_preds, all_true
+    return accuracy, all_preds, all_true, plot_data, debug_batch
 
 
 def train_model(config, data_info, device, hyperparams, num_epochs, save_path=None):
@@ -629,7 +728,7 @@ def train_model(config, data_info, device, hyperparams, num_epochs, save_path=No
 
             # Evaluate and checkpoint every 5 epochs, at epoch 1, and at the last epoch
             if (epoch + 1) % 5 == 0 or epoch == 0 or epoch + 1 == num_epochs:
-                test_acc, _, _ = predict_loader(model, data_info["test_loader"], config, device)
+                test_acc, _, _, _, _ = predict_loader(model, data_info["test_loader"], config, device)
                 print(
                     f"Epoch [{epoch + 1:>2}/{num_epochs}]  Loss: {avg_loss:.4f}  "
                     f"Train Acc: {train_acc:.4f}  Test Acc: {test_acc:.4f}"
@@ -679,7 +778,7 @@ def run_optuna(config, data_info, device):
             num_epochs=config["OPTUNA_EPOCHS"],
             save_path=None,          # Don't save checkpoints during search
         )
-        accuracy, _, _ = predict_loader(model, data_info["test_loader"], config, device)
+        accuracy, _, _, _, _ = predict_loader(model, data_info["test_loader"], config, device)
         return accuracy
 
     study = optuna.create_study(direction="maximize")
@@ -739,35 +838,133 @@ def report_metrics(all_true, all_preds, class_names):
     return cm
 
 
-def plot_results(config, data_info, all_true, all_preds, cm, device_id):
+def plot_results(config, data_info, all_true, all_preds, cm, device_id, plot_data=None):
     """Generate and save three classification diagnostic plots for one device.
 
-    Plot 1 – True vs Predicted class labels over the test timeline.
+    Plot 1 – Input and output summaries plus true vs predicted class labels.
     Plot 2 – Raw power signal with ON-prediction regions shaded.
     Plot 3 – Confusion matrix heatmap.
 
     Files saved: pred_vs_true_dev{id}.png, power_vs_pred_dev{id}.png,
                  confusion_matrix_dev{id}.png
     """
-    # ── Plot 1: predicted vs true class over time ─────────────────────────────
-    fig, ax = plt.subplots(figsize=(14, 4))
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-    ax.plot(all_true, label=f"True ({'/'.join(data_info['class_names'])})", alpha=0.7, linewidth=0.8)
-    ax.plot(
-        all_preds,
-        label=f"Predicted ({'/'.join(data_info['class_names'])})",
-        alpha=0.7,
-        linewidth=0.8,
-        linestyle="--",
-    )
-    ax.set_xlabel("Test Sample Index")
-    ax.set_ylabel("Class")
-    ax.set_title(
-        f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - True vs Predicted "
-        f"({'Changes' if config['USE_DERIVATIVE'] else 'State'}) (Test Set)"
-    )
-    ax.legend()
+
+    # ── Plot 1: representative model input/output with prediction timeline ───
+    if plot_data is not None and config["MODEL_TYPE"] == "snn":
+        fig, axes = plt.subplots(
+            3, 1, figsize=(14, 9), gridspec_kw={"height_ratios": [1.0, 1.0, 1.4]}
+        )
+        ax_in, ax_out, ax_pred = axes
+
+        input_sample = plot_data["plot_input_sample"].cpu()
+        encoded_input_sample = plot_data["plot_encoded_input_sample"].cpu()
+        output_spikes_sample = plot_data["plot_output_spikes_sample"].cpu()
+        output_mem_sample = plot_data["plot_output_mem_sample"].cpu().numpy()
+        sample_index = plot_data["plot_sample_index"]
+        true_label = data_info["class_names"][plot_data["plot_true_label"]]
+        pred_label = data_info["class_names"][plot_data["plot_pred_label"]]
+
+        if config["CODING"] == "raw":
+            in_im = ax_in.imshow(
+                input_sample.numpy().T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap="viridis",
+            )
+            fig.colorbar(in_im, ax=ax_in, pad=0.01, label="Input value")
+        else:
+            splt.raster(encoded_input_sample, ax_in, s=3, c="black")
+        ax_in.set_ylabel("Feature")
+        ax_in.set_xlabel("Time step")
+        ax_in.set_title(f"Sample {sample_index} - Encoded SNN Input")
+
+        splt.raster(output_spikes_sample, ax_out, s=28, c="firebrick")
+        ax_out.set_ylabel("Class")
+        ax_out.set_xlabel("Time step")
+        ax_out.set_yticks(range(len(data_info["class_names"])))
+        ax_out.set_yticklabels(data_info["class_names"])
+        ax_out.set_title(
+            f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - "
+            f"Sample {sample_index} Output Spikes  |  True={true_label}, Pred={pred_label}"
+        )
+        mem_ax = ax_out.twinx()
+        for class_index, class_name in enumerate(data_info["class_names"]):
+            mem_ax.plot(output_mem_sample[:, class_index], linewidth=1.0, alpha=0.5, label=f"{class_name} mem")
+        mem_ax.set_ylabel("Membrane")
+        mem_ax.grid(False)
+
+        ax_pred.plot(all_true, label=f"True ({'/'.join(data_info['class_names'])})", alpha=0.7, linewidth=0.8)
+        ax_pred.plot(
+            all_preds,
+            label=f"Predicted ({'/'.join(data_info['class_names'])})",
+            alpha=0.7,
+            linewidth=0.8,
+            linestyle="--",
+        )
+        ax_pred.set_xlabel("Test Sample Index")
+        ax_pred.set_ylabel("Class")
+        ax_pred.set_title(
+            f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - True vs Predicted "
+            f"({'Changes' if config['USE_DERIVATIVE'] else 'State'}) (Test Set)"
+        )
+        ax_pred.legend()
+    elif plot_data is not None:
+        input_sample = plot_data["plot_input_sample"].cpu().numpy().T
+        logits_sample = plot_data["plot_output_logits_sample"].cpu().numpy()
+        sample_index = plot_data["plot_sample_index"]
+        true_label = data_info["class_names"][plot_data["plot_true_label"]]
+        pred_label = data_info["class_names"][plot_data["plot_pred_label"]]
+
+        fig, axes = plt.subplots(3, 1, figsize=(14, 9), gridspec_kw={"height_ratios": [1.1, 0.9, 1.4]})
+        ax_in, ax_logits, ax_pred = axes
+        in_im = ax_in.imshow(input_sample, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
+        ax_in.set_ylabel("Feature")
+        ax_in.set_xlabel("Time step")
+        ax_in.set_title(f"Sample {sample_index} - Input fed to {config['MODEL_TYPE'].upper()}")
+        fig.colorbar(in_im, ax=ax_in, pad=0.01, label="Input value")
+
+        ax_logits.bar(range(len(logits_sample)), logits_sample, color=["steelblue", "tomato"][: len(logits_sample)])
+        ax_logits.set_xticks(range(len(data_info["class_names"])))
+        ax_logits.set_xticklabels(data_info["class_names"])
+        ax_logits.set_ylabel("Logit")
+        ax_logits.set_title(f"Sample {sample_index} Output  |  True={true_label}, Pred={pred_label}")
+
+        ax_pred.plot(all_true, label=f"True ({'/'.join(data_info['class_names'])})", alpha=0.7, linewidth=0.8)
+        ax_pred.plot(
+            all_preds,
+            label=f"Predicted ({'/'.join(data_info['class_names'])})",
+            alpha=0.7,
+            linewidth=0.8,
+            linestyle="--",
+        )
+        ax_pred.set_xlabel("Test Sample Index")
+        ax_pred.set_ylabel("Class")
+        ax_pred.set_title(
+            f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - True vs Predicted "
+            f"({'Changes' if config['USE_DERIVATIVE'] else 'State'}) (Test Set)"
+        )
+        ax_pred.legend()
+    else:
+        fig, ax_pred = plt.subplots(figsize=(14, 4))
+        ax_pred.plot(all_true, label=f"True ({'/'.join(data_info['class_names'])})", alpha=0.7, linewidth=0.8)
+        ax_pred.plot(
+            all_preds,
+            label=f"Predicted ({'/'.join(data_info['class_names'])})",
+            alpha=0.7,
+            linewidth=0.8,
+            linestyle="--",
+        )
+        ax_pred.set_xlabel("Test Sample Index")
+        ax_pred.set_ylabel("Class")
+        ax_pred.set_title(
+            f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - True vs Predicted "
+            f"({'Changes' if config['USE_DERIVATIVE'] else 'State'}) (Test Set)"
+        )
+        ax_pred.legend()
+
     plt.tight_layout()
     plt.savefig(results_dir / f"pred_vs_true_dev{device_id}.png", dpi=150)
     plt.show()
@@ -822,6 +1019,100 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id):
     plt.colorbar(im)
     plt.tight_layout()
     plt.savefig(results_dir / f"confusion_matrix_dev{device_id}.png", dpi=150)
+    plt.show()
+
+
+def plot_debug_batch(config, data_info, debug_batch, device_id):
+    """Plot the first evaluation batch entering and leaving the classifier."""
+    if debug_batch is None:
+        return
+
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    max_samples = min(int(config["DEBUG_BATCH_PLOT_SAMPLES"]), debug_batch["labels"].shape[0])
+    sample_index = resolve_sample_index(config, debug_batch["labels"].shape[0])
+    true_label = data_info["class_names"][int(debug_batch["labels"][sample_index].item())]
+    pred_label = data_info["class_names"][int(debug_batch["preds"][sample_index].item())]
+
+    if config["MODEL_TYPE"] == "snn":
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        ax_raw, ax_in, ax_out, ax_summary = axes.ravel()
+
+        raw_sample = debug_batch["input_batch"][sample_index].numpy().T
+        raw_im = ax_raw.imshow(raw_sample, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
+        ax_raw.set_title(f"Sample {sample_index} Raw/Input Features")
+        ax_raw.set_xlabel("Time step")
+        ax_raw.set_ylabel("Feature")
+        fig.colorbar(raw_im, ax=ax_raw, pad=0.01, label="Input value")
+
+        encoded_sample = debug_batch["encoded_input_batch"][:, sample_index]
+        if config["CODING"] == "raw":
+            enc_im = ax_in.imshow(
+                encoded_sample.numpy().T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap="Greys",
+            )
+            fig.colorbar(enc_im, ax=ax_in, pad=0.01, label="Encoded value")
+        else:
+            splt.raster(encoded_sample, ax_in, s=3, c="black")
+        ax_in.set_title(f"Sample {sample_index} Encoded Input ({config['CODING']})")
+        ax_in.set_xlabel("Time step")
+        ax_in.set_ylabel("Feature")
+
+        output_spikes = debug_batch["output_spikes_batch"][:, sample_index]
+        splt.raster(output_spikes, ax_out, s=28, c="firebrick")
+        ax_out.set_title(f"Sample {sample_index} Output Spikes  |  True={true_label}, Pred={pred_label}")
+        ax_out.set_xlabel("Time step")
+        ax_out.set_ylabel("Class")
+        ax_out.set_yticks(range(len(data_info["class_names"])))
+        ax_out.set_yticklabels(data_info["class_names"])
+
+        summary_batch = debug_batch["output_summary_batch"][:max_samples].numpy().T
+        summary_im = ax_summary.imshow(
+            summary_batch,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            cmap="magma",
+        )
+        summary_label = "Membrane Avg." if config["SNN_EVAL_MODE"] == "membrane" else "Spike Count"
+        ax_summary.set_title(f"First Test Batch Output Summary ({max_samples} samples)")
+        ax_summary.set_xlabel("Batch sample index")
+        ax_summary.set_ylabel("Class")
+        ax_summary.set_yticks(range(len(data_info["class_names"])))
+        ax_summary.set_yticklabels(data_info["class_names"])
+        fig.colorbar(summary_im, ax=ax_summary, pad=0.01, label=summary_label)
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        ax_sample, ax_batch, ax_out = axes
+
+        sample_input = debug_batch["input_batch"][sample_index].numpy().T
+        sample_im = ax_sample.imshow(sample_input, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
+        ax_sample.set_title(f"Sample {sample_index} Input  |  True={true_label}, Pred={pred_label}")
+        ax_sample.set_xlabel("Time step")
+        ax_sample.set_ylabel("Feature")
+        fig.colorbar(sample_im, ax=ax_sample, pad=0.01, label="Input value")
+
+        batch_summary = debug_batch["input_batch"][:max_samples].mean(dim=1).numpy().T
+        batch_im = ax_batch.imshow(batch_summary, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
+        ax_batch.set_title(f"First Test Batch Mean Input ({max_samples} samples)")
+        ax_batch.set_xlabel("Batch sample index")
+        ax_batch.set_ylabel("Feature")
+        fig.colorbar(batch_im, ax=ax_batch, pad=0.01, label="Mean input")
+
+        logits_batch = debug_batch["output_logits_batch"][:max_samples].numpy().T
+        logit_im = ax_out.imshow(logits_batch, aspect="auto", origin="lower", interpolation="nearest", cmap="coolwarm")
+        ax_out.set_title(f"First Test Batch Output Logits ({max_samples} samples)")
+        ax_out.set_xlabel("Batch sample index")
+        ax_out.set_ylabel("Class")
+        ax_out.set_yticks(range(len(data_info["class_names"])))
+        ax_out.set_yticklabels(data_info["class_names"])
+        fig.colorbar(logit_im, ax=ax_out, pad=0.01, label="Logit")
+
+    plt.tight_layout()
+    plt.savefig(results_dir / f"debug_batch_dev{device_id}.png", dpi=150)
     plt.show()
 
 
@@ -1218,6 +1509,7 @@ def main():
         f"Model: {config['MODEL_TYPE'].upper()}, Coding: {config['CODING']}, "
         f"Features: {'extracted' if config['USE_FEATURES'] else 'raw'}"
     )
+    print(f"Input selector: {describe_feature_selection(config)}")
     print(f"Normalisation - Input: {config['INPUT_NORM']}, Output: {config['OUTPUT_NORM']}")
     print(f"Device IDs: {device_ids}")
     print(f"Target: {'state changes (derivative)' if config['USE_DERIVATIVE'] else 'ON/OFF state'}")
@@ -1225,6 +1517,7 @@ def main():
         print(f"SNN train: {config['SNN_LOSS_MODE']}, SNN eval: {config['SNN_EVAL_MODE']}")
     print(f"Balance: {config['BALANCE_DATA']},  Optuna: {config['USE_OPTUNA']}")
     print(f"Plots — SNN: {config['PLOT_SNN']},  Regression: {config['PLOT_REGRESSION']}")
+    print(f"Debug batch plot: {config['PLOT_DEBUG_BATCH']} (sample index {config['DEBUG_SAMPLE_INDEX']})")
 
     # ── Stage 1: shared feature extraction ────────────────────────────────────
     print("\n=== Loading & extracting shared features ===")
@@ -1266,12 +1559,21 @@ def main():
         snn_models.append(snn_model)
 
         # Evaluate and report classification metrics
-        _, all_preds, all_true = predict_loader(snn_model, data_info["test_loader"], config, device)
+        _, all_preds, all_true, plot_data, debug_batch = predict_loader(
+            snn_model,
+            data_info["test_loader"],
+            config,
+            device,
+            return_plot_data=config["PLOT_SNN"],
+            return_debug_batch=config["PLOT_DEBUG_BATCH"],
+        )
         cm = report_metrics(all_true, all_preds, data_info["class_names"])
 
         # Optionally generate SNN classification plots
         if config["PLOT_SNN"]:
-            plot_results(config, data_info, all_true, all_preds, cm, device_id=dev_id)
+            plot_results(config, data_info, all_true, all_preds, cm, device_id=dev_id, plot_data=plot_data)
+        if config["PLOT_DEBUG_BATCH"]:
+            plot_debug_batch(config, data_info, debug_batch, device_id=dev_id)
 
     # ── Stage 3: multi-device power regression ────────────────────────────────
     if config["DO_REGRESSION"]:
