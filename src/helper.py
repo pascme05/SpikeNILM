@@ -1,7 +1,15 @@
 import numpy as np
-import torch
 from scipy.io import loadmat
-from snntorch import spikegen
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    from snntorch import spikegen
+except ImportError:
+    spikegen = None
 
 
 def load_data(mat_file, ID=0, maxLen=10000):
@@ -113,6 +121,22 @@ def extract_features(X, n_harmonics=15, selector=None, return_names=False):
     return features
 
 
+def compute_feature_deltas(X, mode="absolute"):
+    """Compute consecutive-frame feature differences.
+
+    Args:
+        X: ndarray [n_samples, n_features]
+        mode: 'absolute' -> abs(x_t - x_{t-1}), 'signed' -> x_t - x_{t-1}
+    """
+    deltas = np.diff(X, axis=0, prepend=X[:1])
+    if mode == "absolute":
+        deltas = np.abs(deltas)
+    elif mode != "signed":
+        raise ValueError(f"Unknown delta mode: {mode}. Use 'absolute' or 'signed'.")
+    deltas[0] = 0.0
+    return deltas.astype(np.float32, copy=False)
+
+
 def prepare_input(X_flat, n_samples):
     X_flat = X_flat.reshape(n_samples, -1).astype(np.float32)
     x_min = X_flat.min(axis=0, keepdims=True)
@@ -142,6 +166,9 @@ def balance_sequences(X_seq, Y_seq, rng_seed=42):
 
 
 def encode_spikes(X_batch, coding, device):
+    if spikegen is None:
+        raise ImportError("snntorch is required for encode_spikes but is not installed in this environment.")
+
     batch_size, seq_len, feature_count = X_batch.shape
 
     if coding == "rate":
@@ -167,6 +194,9 @@ def encode_spikes(X_batch, coding, device):
 
 
 def build_target_spikes(labels, num_steps, num_classes, on_rate, off_rate):
+    if torch is None or spikegen is None:
+        raise ImportError("torch and snntorch are required for build_target_spikes but are not installed.")
+
     batch_size = labels.size(0)
     targets = torch.zeros(num_steps, batch_size, num_classes, device=labels.device)
     on_pattern, _ = spikegen.target_rate_code(num_steps=num_steps, rate=on_rate)

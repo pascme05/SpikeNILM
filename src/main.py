@@ -70,6 +70,7 @@ except ImportError:
 from helper import (
     balance_sequences,
     build_target_spikes,
+    compute_feature_deltas,
     create_sequences,
     encode_spikes,
     extract_features,
@@ -108,10 +109,18 @@ def build_config():
             "current_stats": True,
             "power_stats": True,
         },
+        "SNN_FEATURE_SELECTOR": {                                               # Classifier-specific selector (defaults to current-driven change features)
+            "voltage_harmonics": False,
+            "current_harmonics": True,
+            "voltage_stats": False,
+            "current_stats": True,
+            "power_stats": False,
+        },
         "RAW_INPUT_CHANNELS": ["voltage", "current"],                           # Raw mode selector: any subset of ['voltage', 'current']
+        "SNN_RAW_INPUT_CHANNELS": ["current"],                                  # Raw SNN selector when USE_FEATURES=False
         "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
         "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
-        "USE_DERIVATIVE": False,                                                # True = predict state changes;  False = predict ON/OFF
+        "USE_DERIVATIVE": False,                                                 # True = predict state changes;  False = predict ON/OFF
         "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
         "STRIDE": 5,                                                            # Sliding-window stride used during training
         "DEVICE": "auto",                                                       # 'auto' = prefer CUDA, otherwise CPU; can also force 'cuda' or 'cpu'
@@ -127,6 +136,8 @@ def build_config():
         "KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
         "CODING": "rate",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
+        "SNN_INPUT_TRANSFORM": "delta",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
+        "SNN_DELTA_MODE": "absolute",                                           # 'absolute' = magnitude of change, 'signed' = signed change
         "SNN_LOSS_MODE": "membrane",                                            # Loss target: 'membrane' | 'spike'
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
@@ -263,24 +274,41 @@ def denormalize_array(data, normalizer):
     return (data * normalizer["scale"] + normalizer["offset"]).astype(np.float32, copy=False)
 
 
-def describe_feature_selection(config):
-    """Create a short human-readable summary of the active input selector."""
-    if config["USE_FEATURES"]:
-        selector = config["FEATURE_SELECTOR"]
-        labels = []
-        if selector.get("voltage_harmonics", True):
-            labels.append(f"{config['N_HARMONICS']} V-harmonics")
-        if selector.get("current_harmonics", True):
-            labels.append(f"{config['N_HARMONICS']} I-harmonics")
-        if selector.get("voltage_stats", True):
-            labels.append("2 voltage stats")
-        if selector.get("current_stats", True):
-            labels.append("2 current stats")
-        if selector.get("power_stats", True):
-            labels.append("2 power stats")
-        return ", ".join(labels)
+def describe_selector(selector, config, raw_channels=None):
+    """Create a short human-readable summary of an input selector."""
+    if raw_channels is not None:
+        return ", ".join(raw_channels)
 
-    return ", ".join(config["RAW_INPUT_CHANNELS"])
+    labels = []
+    if selector.get("voltage_harmonics", True):
+        labels.append(f"{config['N_HARMONICS']} V-harmonics")
+    if selector.get("current_harmonics", True):
+        labels.append(f"{config['N_HARMONICS']} I-harmonics")
+    if selector.get("voltage_stats", True):
+        labels.append("2 voltage stats")
+    if selector.get("current_stats", True):
+        labels.append("2 current stats")
+    if selector.get("power_stats", True):
+        labels.append("2 power stats")
+    return ", ".join(labels)
+
+
+def describe_feature_selection(config):
+    """Describe the shared feature selector used by the non-SNN shared path."""
+    if config["USE_FEATURES"]:
+        return describe_selector(config["FEATURE_SELECTOR"], config)
+    return describe_selector(None, config, raw_channels=config["RAW_INPUT_CHANNELS"])
+
+
+def describe_snn_input(config):
+    """Describe the classifier-specific SNN input path."""
+    if config["USE_FEATURES"]:
+        base = describe_selector(config["SNN_FEATURE_SELECTOR"], config)
+    else:
+        base = describe_selector(None, config, raw_channels=config["SNN_RAW_INPUT_CHANNELS"])
+    if config["SNN_INPUT_TRANSFORM"] == "delta":
+        return f"{config['SNN_DELTA_MODE']} delta of {base}"
+    return base
 
 
 
@@ -299,13 +327,16 @@ def prepare_shared_features(config):
           voltage/current statistics, and power statistics
 
     Returns a dict with:
-        X_norm        : normalised feature array  [n_samples, input_size]
-        input_size    : number of features per cycle
-        feature_names : list[str] describing the active input dimensions
-        n_samples     : total number of AC cycles loaded
-        split_idx_raw : sample index separating training from test data
-        X_train_t_reg : sliding-window sequences tensor (train) for the regressor
-        X_test_t_reg  : sliding-window sequences tensor (test)  for the regressor
+        X_norm          : normalised shared feature array     [n_samples, input_size]
+        X_snn_norm      : normalised classifier input array   [n_samples, snn_input_size]
+        input_size      : number of shared features per cycle
+        snn_input_size  : number of SNN input features per cycle
+        feature_names   : shared feature names
+        snn_feature_names : classifier-specific feature names
+        n_samples       : total number of AC cycles loaded
+        split_idx_raw   : sample index separating training from test data
+        X_train_t_reg   : sliding-window sequences tensor (train) for the regressor
+        X_test_t_reg    : sliding-window sequences tensor (test)  for the regressor
     """
     X_raw, _ = load_data_multi(f"data/{config['NAME']}.mat", config["DEVICE_IDS"], maxLen=config["MAX_LEN"])
     n_samples = X_raw.shape[0]
@@ -320,9 +351,15 @@ def prepare_shared_features(config):
             selector=config["FEATURE_SELECTOR"],
             return_names=True,
         )
+        X_snn_source, snn_feature_names = extract_features(
+            X_raw,
+            n_harmonics=config["N_HARMONICS"],
+            selector=config["SNN_FEATURE_SELECTOR"],
+            return_names=True,
+        )
         input_size = X_processed.shape[1]
         print(
-            f"Samples: {n_samples}, Features per cycle: {input_size} "
+            f"Samples: {n_samples}, Shared features per cycle: {input_size} "
             f"({describe_feature_selection(config)})"
         )
     else:
@@ -335,10 +372,38 @@ def prepare_shared_features(config):
             for step in range(X_selected.shape[1])
             for channel in config["RAW_INPUT_CHANNELS"]
         ]
-        print(f"Samples: {n_samples}, Raw input size: {input_size} ({describe_feature_selection(config)})")
+        X_snn_selected = select_input_channels(X_raw, config["SNN_RAW_INPUT_CHANNELS"])
+        X_snn_source = X_snn_selected.reshape(n_samples, -1).astype(np.float32)
+        snn_feature_names = [
+            f"{channel}_t{step}"
+            for step in range(X_snn_selected.shape[1])
+            for channel in config["SNN_RAW_INPUT_CHANNELS"]
+        ]
+        print(
+            f"Samples: {n_samples}, Shared raw input size: {input_size} "
+            f"({describe_feature_selection(config)})"
+        )
+
+    if config["SNN_INPUT_TRANSFORM"] == "delta":
+        X_snn_processed = compute_feature_deltas(X_snn_source, mode=config["SNN_DELTA_MODE"])
+        snn_feature_names = [f"d_{name}" for name in snn_feature_names]
+    elif config["SNN_INPUT_TRANSFORM"] == "absolute":
+        X_snn_processed = X_snn_source.astype(np.float32, copy=False)
+    else:
+        raise ValueError(
+            f"Unknown SNN_INPUT_TRANSFORM: {config['SNN_INPUT_TRANSFORM']}. Use 'delta' or 'absolute'."
+        )
+
+    snn_input_size = X_snn_processed.shape[1]
+    print(
+        f"SNN input per cycle: {snn_input_size} "
+        f"({describe_snn_input(config)})"
+    )
 
     input_normalizer = fit_normalizer(X_processed[:split_idx_raw], config["INPUT_NORM"])
+    snn_input_normalizer = fit_normalizer(X_snn_processed[:split_idx_raw], config["INPUT_NORM"])
     X_norm = apply_normalizer(X_processed, input_normalizer)
+    X_snn_norm = apply_normalizer(X_snn_processed, snn_input_normalizer)
     seq_len = config["SEQ_LEN"]
 
     # Build sliding-window sequences from the feature matrix.
@@ -351,8 +416,11 @@ def prepare_shared_features(config):
 
     return {
         "X_norm": X_norm,
+        "X_snn_norm": X_snn_norm,
         "input_size": input_size,
+        "snn_input_size": snn_input_size,
         "feature_names": feature_names,
+        "snn_feature_names": snn_feature_names,
         "input_normalizer": input_normalizer,
         "n_samples": n_samples,
         "split_idx_raw": split_idx_raw,
@@ -387,7 +455,7 @@ def prepare_device_classification(config, shared, device_id, Y_device, device):
         Y_train_power_t : torch.float32 tensor of training power values  [n_train_seq]
         Y_test_power_t  : torch.float32 tensor of test power values      [n_test_seq]
     """
-    X_norm = shared["X_norm"]
+    X_norm = shared["X_snn_norm"] if config["MODEL_TYPE"] == "snn" else shared["X_norm"]
     split_idx_raw = shared["split_idx_raw"]
     seq_len = config["SEQ_LEN"]
 
@@ -467,9 +535,10 @@ def prepare_device_classification(config, shared, device_id, Y_device, device):
     return {
         "train_loader": train_loader,
         "test_loader": test_loader,
-        "input_size": shared["input_size"],
+        "input_size": shared["snn_input_size"] if config["MODEL_TYPE"] == "snn" else shared["input_size"],
         "output_size": 2,
         "class_names": class_names,
+        "feature_names": shared["snn_feature_names"] if config["MODEL_TYPE"] == "snn" else shared["feature_names"],
         "raw_y": Y_device,
         "split_idx_raw": split_idx_raw,
         "Y_train_power_t": Y_train_power_t,
@@ -623,6 +692,8 @@ def predict_loader(
     all_true = []
     plot_data = None
     debug_batch = None
+    plot_input_strength = []
+    plot_change_score = []
 
     with torch.no_grad():
         for X_batch, Y_batch in loader:
@@ -633,6 +704,9 @@ def predict_loader(
                 spk_rec, mem_rec = model(spike_input)
                 preds = snn_predict(spk_rec, mem_rec, config["SNN_EVAL_MODE"])
                 output_summary = mem_rec.mean(dim=0) if config["SNN_EVAL_MODE"] == "membrane" else spk_rec.sum(dim=0)
+                if return_plot_data:
+                    plot_input_strength.append(X_batch.abs().mean(dim=(1, 2)).cpu().numpy())
+                    plot_change_score.append(output_summary[:, 1].cpu().numpy())
 
                 if return_plot_data and plot_data is None:
                     plot_data = {
@@ -678,6 +752,9 @@ def predict_loader(
     all_preds = np.concatenate(all_preds)
     all_true = np.concatenate(all_true)
     accuracy = (all_preds == all_true).mean()
+    if plot_data is not None and plot_input_strength:
+        plot_data["plot_input_strength"] = np.concatenate(plot_input_strength)
+        plot_data["plot_change_score"] = np.concatenate(plot_change_score)
     return accuracy, all_preds, all_true, plot_data, debug_batch
 
 
@@ -854,9 +931,9 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id, plot_dat
     # ── Plot 1: representative model input/output with prediction timeline ───
     if plot_data is not None and config["MODEL_TYPE"] == "snn":
         fig, axes = plt.subplots(
-            3, 1, figsize=(14, 9), gridspec_kw={"height_ratios": [1.0, 1.0, 1.4]}
+            4, 1, figsize=(14, 11), gridspec_kw={"height_ratios": [1.0, 1.0, 1.0, 1.4]}
         )
-        ax_in, ax_out, ax_pred = axes
+        ax_delta, ax_in, ax_out, ax_pred = axes
 
         input_sample = plot_data["plot_input_sample"].cpu()
         encoded_input_sample = plot_data["plot_encoded_input_sample"].cpu()
@@ -866,20 +943,32 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id, plot_dat
         true_label = data_info["class_names"][plot_data["plot_true_label"]]
         pred_label = data_info["class_names"][plot_data["plot_pred_label"]]
 
+        delta_im = ax_delta.imshow(
+            input_sample.numpy().T,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            cmap="viridis",
+        )
+        ax_delta.set_ylabel("Feature")
+        ax_delta.set_xlabel("Time step")
+        ax_delta.set_title(f"Sample {sample_index} - SNN Change Signal ({describe_snn_input(config)})")
+        fig.colorbar(delta_im, ax=ax_delta, pad=0.01, label="Normalized change")
+
         if config["CODING"] == "raw":
-            in_im = ax_in.imshow(
-                input_sample.numpy().T,
+            enc_im = ax_in.imshow(
+                encoded_input_sample.numpy().T,
                 aspect="auto",
                 origin="lower",
                 interpolation="nearest",
-                cmap="viridis",
+                cmap="Greys",
             )
-            fig.colorbar(in_im, ax=ax_in, pad=0.01, label="Input value")
+            fig.colorbar(enc_im, ax=ax_in, pad=0.01, label="Encoded value")
         else:
             splt.raster(encoded_input_sample, ax_in, s=3, c="black")
         ax_in.set_ylabel("Feature")
         ax_in.set_xlabel("Time step")
-        ax_in.set_title(f"Sample {sample_index} - Encoded SNN Input")
+        ax_in.set_title("Encoded input sent to the SNN")
 
         splt.raster(output_spikes_sample, ax_out, s=28, c="firebrick")
         ax_out.set_ylabel("Class")
@@ -979,19 +1068,53 @@ def plot_results(config, data_info, all_true, all_preds, cm, device_id, plot_dat
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.plot(y_test_raw, label="True Power (W)", color="steelblue", linewidth=0.8)
     ax.axhline(config["THRESHOLD"], color="gray", linestyle=":", label=f"Threshold ({config['THRESHOLD']} W)")
-    ax.fill_between(
-        range(len(all_preds)),
-        0,
-        y_test_raw.max(),
-        where=(all_preds == 1),   # Shade wherever the model predicts ON
-        alpha=0.15,
-        color="red",
-        label="Predicted ON",
-    )
+    if config["USE_DERIVATIVE"]:
+        true_change_idx = np.flatnonzero(all_true == 1)
+        pred_change_idx = np.flatnonzero(all_preds == 1)
+        if len(true_change_idx) > 0:
+            ax.vlines(true_change_idx, 0, y_test_raw.max(), colors="green", linewidth=0.8, alpha=0.45, label="True change")
+        if len(pred_change_idx) > 0:
+            ax.vlines(pred_change_idx, 0, y_test_raw.max(), colors="tomato", linewidth=0.8, alpha=0.55, linestyles="--", label="Predicted change")
+        if plot_data is not None and "plot_input_strength" in plot_data:
+            ax_change = ax.twinx()
+            ax_change.plot(
+                plot_data["plot_input_strength"],
+                color="darkorange",
+                linewidth=1.0,
+                alpha=0.8,
+                label="Mean input change",
+            )
+            ax_change.plot(
+                plot_data["plot_change_score"],
+                color="firebrick",
+                linewidth=1.0,
+                alpha=0.5,
+                label="Output change score",
+            )
+            ax_change.set_ylabel("Change activity")
+            ax_change.grid(False)
+            lines_left, labels_left = ax.get_legend_handles_labels()
+            lines_right, labels_right = ax_change.get_legend_handles_labels()
+            ax.legend(lines_left + lines_right, labels_left + labels_right, loc="upper right")
+        else:
+            ax.legend()
+    else:
+        ax.fill_between(
+            range(len(all_preds)),
+            0,
+            y_test_raw.max(),
+            where=(all_preds == 1),   # Shade wherever the model predicts ON
+            alpha=0.15,
+            color="red",
+            label="Predicted ON",
+        )
+        ax.legend()
     ax.set_xlabel("Test Sample Index")
     ax.set_ylabel("Power (W)")
-    ax.set_title(f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - Predicted ON Regions vs True Power")
-    ax.legend()
+    ax.set_title(
+        f"{config['MODEL_TYPE'].upper()} [{config['CODING']}] Device {device_id} - "
+        f"{'Change events and change activity' if config['USE_DERIVATIVE'] else 'Predicted ON Regions vs True Power'}"
+    )
     plt.tight_layout()
     plt.savefig(results_dir / f"power_vs_pred_dev{device_id}.png", dpi=150)
     plt.show()
@@ -1040,7 +1163,7 @@ def plot_debug_batch(config, data_info, debug_batch, device_id):
 
         raw_sample = debug_batch["input_batch"][sample_index].numpy().T
         raw_im = ax_raw.imshow(raw_sample, aspect="auto", origin="lower", interpolation="nearest", cmap="viridis")
-        ax_raw.set_title(f"Sample {sample_index} Raw/Input Features")
+        ax_raw.set_title(f"Sample {sample_index} SNN Input Features ({describe_snn_input(config)})")
         ax_raw.set_xlabel("Time step")
         ax_raw.set_ylabel("Feature")
         fig.colorbar(raw_im, ax=ax_raw, pad=0.01, label="Input value")
@@ -1057,7 +1180,7 @@ def plot_debug_batch(config, data_info, debug_batch, device_id):
             fig.colorbar(enc_im, ax=ax_in, pad=0.01, label="Encoded value")
         else:
             splt.raster(encoded_sample, ax_in, s=3, c="black")
-        ax_in.set_title(f"Sample {sample_index} Encoded Input ({config['CODING']})")
+        ax_in.set_title(f"Sample {sample_index} Encoded Change Input ({config['CODING']})")
         ax_in.set_xlabel("Time step")
         ax_in.set_ylabel("Feature")
 
@@ -1078,7 +1201,7 @@ def plot_debug_batch(config, data_info, debug_batch, device_id):
             cmap="magma",
         )
         summary_label = "Membrane Avg." if config["SNN_EVAL_MODE"] == "membrane" else "Spike Count"
-        ax_summary.set_title(f"First Test Batch Output Summary ({max_samples} samples)")
+        ax_summary.set_title(f"First Test Batch Change Summary ({max_samples} samples)")
         ax_summary.set_xlabel("Batch sample index")
         ax_summary.set_ylabel("Class")
         ax_summary.set_yticks(range(len(data_info["class_names"])))
@@ -1515,6 +1638,13 @@ def main():
     print(f"Target: {'state changes (derivative)' if config['USE_DERIVATIVE'] else 'ON/OFF state'}")
     if config["MODEL_TYPE"] == "snn":
         print(f"SNN train: {config['SNN_LOSS_MODE']}, SNN eval: {config['SNN_EVAL_MODE']}")
+        print(f"SNN classifier input: {describe_snn_input(config)}")
+        if config["SNN_INPUT_TRANSFORM"] == "delta" and not config["USE_DERIVATIVE"]:
+            print("WARNING: delta-style SNN input is usually paired with USE_DERIVATIVE=True.")
+        if config["CODING"] in {"rate", "latency"} and config["INPUT_NORM"] != "0-1":
+            print("WARNING: rate/latency coding works best when INPUT_NORM='0-1'.")
+        if config["CODING"] == "rate" and config["SNN_INPUT_TRANSFORM"] == "delta" and config["SNN_DELTA_MODE"] == "signed":
+            print("WARNING: signed delta inputs can suppress rate coding because negative values do not map naturally to spike rates.")
     print(f"Balance: {config['BALANCE_DATA']},  Optuna: {config['USE_OPTUNA']}")
     print(f"Plots — SNN: {config['PLOT_SNN']},  Regression: {config['PLOT_REGRESSION']}")
     print(f"Debug batch plot: {config['PLOT_DEBUG_BATCH']} (sample index {config['DEBUG_SAMPLE_INDEX']})")
