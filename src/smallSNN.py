@@ -30,11 +30,15 @@
 import warnings
 import numpy as np
 import torch
+import torch.nn as nn
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
+import snntorch as snn
 from snntorch import spikegen
 from snntorch import spikeplot as splt
+from snntorch import surrogate
+from torch.utils.data import DataLoader, TensorDataset
 
 #######################################################################################################################
 # Helper Functions
@@ -87,8 +91,40 @@ def load_data(mat_file, ID=0, maxLen=10000):
         Y = Y[:maxLen]
 
     X = X[:, 2:277, :]
-    Y = Y[:, 1 + ID]
+
+    if ID == -1:
+        Y = Y[:, 1:]
+    else:   
+        Y = Y[:, 1 + ID]
+
     return X, Y
+
+
+class SmallSNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, beta=0.9):
+        super().__init__()
+        spike_grad = surrogate.fast_sigmoid()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
+    def forward(self, x):
+        batch_size, num_steps, _ = x.shape
+        mem1 = torch.zeros(batch_size, self.fc1.out_features, device=x.device)
+        mem2 = torch.zeros(batch_size, self.fc2.out_features, device=x.device)
+        spk_rec = []
+        mem_rec = []
+
+        for step in range(num_steps):
+            cur1 = self.fc1(x[:, step, :])
+            spk1, mem1 = self.lif1(cur1, mem1)
+            cur2 = self.fc2(spk1)
+            spk2, mem2 = self.lif2(cur2, mem2)
+            spk_rec.append(spk2)
+            mem_rec.append(mem2)
+
+        return torch.stack(spk_rec, dim=1), torch.stack(mem_rec, dim=1)
 
 #######################################################################################################################
 # Main Code
@@ -101,9 +137,10 @@ def main():
     # Dataset parameters
     # ------------------------------------------
     mat_file = "data/redd3HF.mat"
-    ID = 5
+    ID = -1
     Ntmax = 10000
     y_max = 500
+    th = 50
 
     # ------------------------------------------
     # Preprocessing parameters
@@ -111,6 +148,20 @@ def main():
     Nf = 15 # Number of Fourier coefficients to keep
     encoding = "rate" # 'rate' or 'temporal'
     num_steps = 100 # Number of time steps for spike encoding
+
+    # ------------------------------------------
+    # SNN parameters
+    # ------------------------------------------
+    num_epochs = 5
+    split = 0.8
+    batch_size=256
+    lr=1e-3
+
+    # ------------------------------------------
+    # Other parameters
+    # ------------------------------------------
+    plotting = 1
+
 
     # ==============================================================================
     # Loading REDD Dataset
@@ -129,11 +180,11 @@ def main():
     V_ac = np.squeeze(X[:,:,0])
 
     # ------------------------------------------
-    # Normalization
+    # Normalization Values
     # ------------------------------------------
     I_ac_max = np.max(np.abs(I_ac), axis=1, keepdims=True)
     V_ac_max = np.max(np.abs(V_ac), axis=1, keepdims=True)
-    p_t = Y  / np.max(Y)  # Normalize target to [0, 1]
+    power_scale = float(np.max(Y)) if np.max(Y) > 0 else 1.0
 
     # ==============================================================================
     # Preprocessing
@@ -143,7 +194,13 @@ def main():
     # ------------------------------------------
     If_ac = np.abs(np.fft.rfft(I_ac, axis=1))[:, 0:Nf + 1] / I_ac.shape[1] * 2
     Vf_ac = np.abs(np.fft.rfft(V_ac, axis=1))[:, 0:Nf + 1] / V_ac.shape[1] * 2
-    F_ac = np.concatenate([Vf_ac, If_ac], axis=1)
+
+    # ------------------------------------------
+    # Label Binarization
+    # ------------------------------------------
+    c_t = Y
+    c_t(c_t < th) = 0
+    c_t(c_t >= th) = 1
 
     # ------------------------------------------
     # RMS Values
@@ -165,8 +222,12 @@ def main():
     # ------------------------------------------
     # Normalization
     # ------------------------------------------
+    # Input normalization to [0, 1]
     If_ac_norm = If_ac / (I_ac_max + 1e-8)
     Vf_ac_norm = Vf_ac / (V_ac_max + 1e-8)
+
+    # Target normalization to [0, 1]
+    p_t = Y / power_scale  # Normalize target to [0, 1]
     
     # Test plot
     """
@@ -218,6 +279,7 @@ def main():
     if encoding == "rate":
         # Rate-based encoding
         ps_t = spikegen.rate(torch.from_numpy(p_t), num_steps=num_steps)
+        cs_t = spikegen.rate(torch.from_numpy(cs_t), num_steps=num_steps)
     elif encoding == "temporal":
         # Temporal-based encoding
         pass
@@ -245,10 +307,147 @@ def main():
     # Training SNN Network
     # ==============================================================================
     # ------------------------------------------
+    # Settings
+    # ------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # ------------------------------------------
     # Data Loaders
     # ------------------------------------------
-    test = 1
+    input_spikes = torch.cat((Vs_ac, Is_ac), dim=2).permute(1, 0, 2).float()
+    target_spikes = cs_t.transpose(0, 1).unsqueeze(-1).float()
+    split_idx = int(split * input_spikes.shape[0])
+    train_dataset = TensorDataset(input_spikes[:split_idx], target_spikes[:split_idx])
+    val_dataset = TensorDataset(input_spikes[split_idx:], target_spikes[split_idx:])
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=0)
 
+
+    # -------------------------------------------------
+    # Model
+    # -------------------------------------------------
+    model = model_class(input_dim=x.shape[-1]).to(device)
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    train_losses, val_losses = [], []
+
+    # -------------------------------------------------
+    # Training
+    # -------------------------------------------------
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+
+            optimizer.zero_grad()
+
+            spk_rec, mem_rec = model(xb)  # mem_rec: [B, 20]
+            loss = loss_fn(mem_rec, yb)
+
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * xb.size(0)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+
+                _, mem_rec = model(xb)
+                val_loss += loss_fn(mem_rec, yb).item() * xb.size(0)
+
+        train_loss /= len(train_dataset)
+        val_loss   /= max(len(val_dataset), 1)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        print(f"Epoch {epoch+1}/{num_epochs} | Train: {train_loss:.4f} | Val: {val_loss:.4f}")
+
+    # -------------------------------------------------
+    # Testing / Evaluation
+    # -------------------------------------------------
+    model.eval()
+
+    all_spk, all_logits, all_targets = [], [], []
+
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb, yb = xb.to(device), yb.to(device)
+
+            spk_rec, mem_rec = model(xb)
+
+            all_spk.append(spk_rec.cpu())
+            all_logits.append(mem_rec.cpu())
+            all_targets.append(yb.cpu())
+
+    if len(all_targets) == 0:
+        print("Empty validation set.")
+        return None
+
+    spk = torch.cat(all_spk)
+    logits = torch.cat(all_logits)
+    targets = torch.cat(all_targets)
+
+    probs = torch.sigmoid(logits)
+    preds = (probs >= 0.5).float()
+
+    # -------------------------------------------------
+    # Metrics
+    # -------------------------------------------------
+    y_true = targets.numpy().astype(int).ravel()
+    y_pred = preds.numpy().astype(int).ravel()
+
+    tp = np.sum((y_pred == 1) & (y_true == 1))
+    tn = np.sum((y_pred == 0) & (y_true == 0))
+    fp = np.sum((y_pred == 1) & (y_true == 0))
+    fn = np.sum((y_pred == 0) & (y_true == 1))
+
+    accuracy = (tp + tn) / max(tp + tn + fp + fn, 1)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    print("\nClassification Metrics:")
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1:        {f1:.4f}")
+
+    # -------------------------------------------------
+    # Power Decoding
+    # -------------------------------------------------
+    true_power = Y[split_idx:]
+
+    pred_power = probs.mean(dim=1).numpy() * power_scale
+
+    mae = np.mean(np.abs(pred_power - true_power))
+    rmse = np.sqrt(np.mean((pred_power - true_power) ** 2))
+    corr = np.corrcoef(pred_power, true_power)[0, 1] if len(true_power) > 1 else np.nan
+
+    print("\nPower Metrics:")
+    print(f"MAE:  {mae:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"Corr: {corr:.4f}")
+
+    # -------------------------------------------------
+    # Plotting
+    # -------------------------------------------------
+    if plotting:
+        plt.figure(figsize=(12,5))
+        plt.plot(train_losses, label="Train")
+        plt.plot(val_losses, label="Val")
+        plt.title("Loss Curve")
+        plt.legend()
+        plt.grid()
+        plt.show()
 
 #######################################################################################################################
 # Run Code
