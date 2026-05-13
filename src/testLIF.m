@@ -5,24 +5,24 @@
 Nf = 11;                                                                    % Number of harmonics
 fs = 16500;                                                                 % Sampling frequency (Hz)
 fel = 60;                                                                   % Grid frequency (Hz)
-Nt_max = 10000;                                                             % Limit max number of samples
-th = 100;                                                                    % Threshold for load changes
+Nt_max = 3600;                                                             % Limit max number of samples
+th = 50;                                                                    % Threshold for load changes
 ID = 5;                                                                     % ID selector for single device
 
 % SNN Coding
 T_sim = 50;                                                                 % Number of time steps per sample
 max_rate = 100;                                                             % Max spike rate (Hz-like scale)
 tau = 10;                                                                   % Membrane time constant
-V_th = 5;                                                                   % Firing threshold
+V_th = 1;                                                                   % Firing threshold
 V_reset = 0;                                                                % Reset potential
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Load Data
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 load("C:\Users\schir\OneDrive\Studium\34_Github\SpikeNILM\data\redd3HF.mat")
-time = squeeze(input(1:Nt_max,1,1));
-X = squeeze(input(1:Nt_max,3:end,:));
-y = squeeze(output(1:Nt_max,3:end));
+time = squeeze(input(1001:Nt_max,1,1));
+X = squeeze(input(1001:Nt_max,3:end,:));
+y = squeeze(output(1001:Nt_max,3:end));
 [Nt, M] = size(y);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -58,7 +58,8 @@ dV_f_ac = [zeros(1, Nf); abs(diff(V_f_ac))];
 
 % Ouput
 dydt = [zeros(1, M); diff(y)];
-s = abs(dydt);
+s = abs(dydt)
+% s= dydt;
 s(s < th) = 0;
 s(s >=th) = 1;
 s_agg = sum(s')';
@@ -94,7 +95,7 @@ end
 % Output storage
 lif_out = zeros(Nt*T_sim,1);   
 lif_mem = zeros(Nt*T_sim,1); 
-lif_time = linspace(0, time(end), Nt*T_sim);
+lif_time = linspace(time(1), time(end), Nt*T_sim);
 
 % Init
 V = 0;  % continuous membrane
@@ -138,12 +139,15 @@ plot(time, Pact);
 hold on
 plot(time, Psum);
 grid on;
-legend(["P_{agg}", "P_{sum}"]);
+legend(["P_{agg}", "P_{app}"]);
 ylabel("Power (W)")
+xticks([]);
 title('Aggregated Power and Summed Node Power');
 
 subplot(4,1,2);
-imagesc(log(dI_f_ac)');
+imagesc(time, [], log(dI_f_ac)');
+ylabel("Harmonic number (f/fel)")
+xticks([]);
 title('Input Current Harmonics');
 
 subplot(4,1,3);
@@ -152,6 +156,7 @@ hold on;
 plot(lif_time, V_th*ones(size(lif_time)));
 grid on;
 ylabel("Voltage (V)")
+xticks([]);
 title('LIF Membrane Potential');
 
 subplot(4,1,4);
@@ -163,4 +168,7 @@ legend(["S_{pred}", "S_{true}"]);
 ylabel("State (-)")
 xlabel("time (sec)")
 title('LIF Output vs. Ground Truth');
+
+ax = findall(gcf,'type','axes');
+linkaxes(ax,'x');
 

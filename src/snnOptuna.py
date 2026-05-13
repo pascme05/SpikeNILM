@@ -21,6 +21,11 @@ from snntorch import spikegen
 from snntorch import surrogate
 from torch.utils.data import DataLoader, TensorDataset
 
+try:
+    import optuna
+except ImportError:
+    optuna = None
+
 #######################################################################################################################
 # Helper Functions
 #######################################################################################################################
@@ -58,9 +63,9 @@ def get_config_default():
         # "harmonics+state": reduced FFT + predicted binary device states.
         # "encoded+full_fft": full FFT + predicted states; this also forces
         # `num_steps` to the full FFT length inside main().
-        "lstm_feature_mode": "harmonics+state",
+        "lstm_feature_mode": "harmonics",
         # Number of consecutive cycles/samples given to the LSTM as one sequence.
-        "lstm_n_cycles": 5,
+        "lstm_n_cycles": 20,
 
         # Shared training setup.
         "split": 0.8,
@@ -80,6 +85,14 @@ def get_config_default():
         "lstm_lr": 1e-3,
         "lstm_patience": 10,
 
+        # Optuna search for LSTM hyper-parameters.
+        # When enabled, Optuna tunes the final LSTM training setup before the
+        # actual full LSTM fit runs.
+        "optimize_lstm": 0,
+        "optuna_n_trials": 20,
+        "optuna_epochs": 10,
+        "optuna_patience": 5,
+
         # Set to 0 for fast runs without figures.
         "plotting": 1,
     }
@@ -91,6 +104,9 @@ def get_config_fast():
     cfg["snn_epochs"] = 3
     cfg["lstm_epochs"] = 3
     cfg["batch_size"] = 128
+    cfg["optuna_n_trials"] = 2
+    cfg["optuna_epochs"] = 2
+    cfg["optuna_patience"] = 2
     cfg["plotting"] = 0
     return cfg
 
@@ -137,90 +153,163 @@ def build_sliding_window(feature_matrix, window_size):
     windows = np.stack([feat_padded[idx:idx + window_size] for idx in range(n_samples)], axis=0)
     return windows.astype(np.float32)
 
-def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
+def get_lstm_params_from_cfg(cfg):
+    return {
+        "lstm_hidden": cfg["lstm_hidden"],
+        "lstm_layers": cfg["lstm_layers"],
+        "lstm_lr": cfg["lstm_lr"],
+    }
+
+def fit_lstm_model(lstm_inputs, y_data, split_idx, lstm_params, batch_size, epochs, patience, device):
+    y_power_max = np.max(np.abs(y_data), axis=0, keepdims=True)
+    y_power_max[y_power_max == 0] = 1.0
+    y_data_norm = y_data / y_power_max
+
+    reg_targets = torch.from_numpy(y_data_norm).float()
+    reg_train_dataset = TensorDataset(lstm_inputs[:split_idx], reg_targets[:split_idx])
+    reg_val_dataset = TensorDataset(lstm_inputs[split_idx:], reg_targets[split_idx:])
+    reg_train_loader = DataLoader(reg_train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    reg_val_loader = DataLoader(reg_val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
     lstm_model = nn.LSTM(
         input_size=lstm_inputs.shape[-1],
-        hidden_size=cfg["lstm_hidden"],
-        num_layers=cfg["lstm_layers"],
+        hidden_size=lstm_params["lstm_hidden"],
+        num_layers=lstm_params["lstm_layers"],
         batch_first=True,
     ).to(device)
-    reg_head = nn.Linear(cfg["lstm_hidden"], y_data.shape[-1]).to(device)
+    reg_head = nn.Linear(lstm_params["lstm_hidden"], y_data.shape[-1]).to(device)
     reg_loss_fn = nn.MSELoss()
-    reg_optimizer = torch.optim.Adam(list(lstm_model.parameters()) + list(reg_head.parameters()), lr=cfg["lstm_lr"])
+    reg_optimizer = torch.optim.Adam(list(lstm_model.parameters()) + list(reg_head.parameters()), lr=lstm_params["lstm_lr"])
 
     train_losses = []
     val_losses = []
-    run_mode = cfg["run_mode"]
+    best_val_loss = float("inf")
+    best_lstm_state = None
+    best_reg_head_state = None
+    no_improve = 0
 
-    if run_mode in ["train", "both"]:
-        y_power_max = np.max(np.abs(y_data), axis=0, keepdims=True)
-        y_power_max[y_power_max == 0] = 1.0
-        y_data_norm = y_data / y_power_max
+    for epoch in range(epochs):
+        lstm_model.train()
+        reg_head.train()
+        epoch_train_loss = 0.0
 
-        reg_targets = torch.from_numpy(y_data_norm).float()
-        reg_train_dataset = TensorDataset(lstm_inputs[:split_idx], reg_targets[:split_idx])
-        reg_val_dataset = TensorDataset(lstm_inputs[split_idx:], reg_targets[split_idx:])
-        reg_train_loader = DataLoader(reg_train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
-        reg_val_loader = DataLoader(reg_val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
+        for xb, yb in reg_train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            reg_optimizer.zero_grad()
+            lstm_out, _ = lstm_model(xb)
+            reg_out = reg_head(lstm_out[:, -1, :])
+            reg_loss = reg_loss_fn(reg_out, yb)
+            reg_loss.backward()
+            reg_optimizer.step()
+            epoch_train_loss += reg_loss.item() * xb.size(0)
 
-        best_val_loss = float("inf")
-        best_lstm_state = None
-        best_reg_head_state = None
-        no_improve = 0
-
-        for epoch in range(cfg["lstm_epochs"]):
-            lstm_model.train()
-            reg_head.train()
-            epoch_train_loss = 0.0
-
-            for xb, yb in reg_train_loader:
+        lstm_model.eval()
+        reg_head.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in reg_val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                reg_optimizer.zero_grad()
                 lstm_out, _ = lstm_model(xb)
                 reg_out = reg_head(lstm_out[:, -1, :])
-                reg_loss = reg_loss_fn(reg_out, yb)
-                reg_loss.backward()
-                reg_optimizer.step()
-                epoch_train_loss += reg_loss.item() * xb.size(0)
+                epoch_val_loss += reg_loss_fn(reg_out, yb).item() * xb.size(0)
 
-            lstm_model.eval()
-            reg_head.eval()
-            epoch_val_loss = 0.0
-            with torch.no_grad():
-                for xb, yb in reg_val_loader:
-                    xb = xb.to(device)
-                    yb = yb.to(device)
-                    lstm_out, _ = lstm_model(xb)
-                    reg_out = reg_head(lstm_out[:, -1, :])
-                    epoch_val_loss += reg_loss_fn(reg_out, yb).item() * xb.size(0)
+        epoch_train_loss /= max(len(reg_train_dataset), 1)
+        epoch_val_loss /= max(len(reg_val_dataset), 1)
+        train_losses.append(epoch_train_loss)
+        val_losses.append(epoch_val_loss)
 
-            epoch_train_loss /= max(len(reg_train_dataset), 1)
-            epoch_val_loss /= max(len(reg_val_dataset), 1)
-            train_losses.append(epoch_train_loss)
-            val_losses.append(epoch_val_loss)
-            print(f"LSTM {epoch + 1}/{cfg['lstm_epochs']} | Train: {epoch_train_loss:.4f} | Val: {epoch_val_loss:.4f}")
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            best_lstm_state = copy.deepcopy(lstm_model.state_dict())
+            best_reg_head_state = copy.deepcopy(reg_head.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                break
 
-            if epoch_val_loss < best_val_loss:
-                best_val_loss = epoch_val_loss
-                best_lstm_state = copy.deepcopy(lstm_model.state_dict())
-                best_reg_head_state = copy.deepcopy(reg_head.state_dict())
-                no_improve = 0
-            else:
-                no_improve += 1
-                if no_improve >= cfg["lstm_patience"]:
-                    print(f"LSTM early stopping at epoch {epoch + 1}")
-                    break
+    if best_lstm_state is not None:
+        lstm_model.load_state_dict(best_lstm_state)
+        reg_head.load_state_dict(best_reg_head_state)
 
-        if best_lstm_state is not None:
-            lstm_model.load_state_dict(best_lstm_state)
-            reg_head.load_state_dict(best_reg_head_state)
+    return {
+        "lstm_model": lstm_model,
+        "reg_head": reg_head,
+        "y_power_max": y_power_max,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "best_val_loss": best_val_loss,
+    }
+
+def optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device):
+    if optuna is None:
+        raise ImportError("Optuna is not installed. Install optuna or disable cfg['optimize_lstm'].")
+
+    def objective(trial):
+        lstm_params = {
+            "lstm_hidden": trial.suggest_categorical("lstm_hidden", [32, 64, 128, 256]),
+            "lstm_layers": trial.suggest_int("lstm_layers", 1, 2),
+            "lstm_lr": trial.suggest_float("lstm_lr", 1e-4, 1e-2, log=True),
+        }
+        fit_result = fit_lstm_model(
+            lstm_inputs,
+            y_data,
+            split_idx,
+            lstm_params,
+            cfg["batch_size"],
+            cfg["optuna_epochs"],
+            cfg["optuna_patience"],
+            device,
+        )
+        return fit_result["best_val_loss"]
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=cfg["optuna_n_trials"])
+    return study.best_params, study.best_value
+
+def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
+    train_losses = []
+    val_losses = []
+    run_mode = cfg["run_mode"]
+    best_params = None
+    best_optuna_value = None
+
+    if run_mode in ["train", "both"]:
+        if cfg.get("optimize_lstm", 0):
+            best_params, best_optuna_value = optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device)
+            print(f"Optuna best LSTM params: {best_params}")
+            print(f"Optuna best validation loss: {best_optuna_value:.6f}")
+        else:
+            best_params = get_lstm_params_from_cfg(cfg)
+
+        fit_result = fit_lstm_model(
+            lstm_inputs,
+            y_data,
+            split_idx,
+            best_params,
+            cfg["batch_size"],
+            cfg["lstm_epochs"],
+            cfg["lstm_patience"],
+            device,
+        )
+        lstm_model = fit_result["lstm_model"]
+        reg_head = fit_result["reg_head"]
+        y_power_max = fit_result["y_power_max"]
+        train_losses = fit_result["train_losses"]
+        val_losses = fit_result["val_losses"]
+
+        for epoch, (train_loss, val_loss) in enumerate(zip(train_losses, val_losses), start=1):
+            print(f"LSTM {epoch}/{cfg['lstm_epochs']} | Train: {train_loss:.4f} | Val: {val_loss:.4f}")
 
         torch.save(
             {
                 "lstm_state_dict": lstm_model.state_dict(),
                 "reg_head_state_dict": reg_head.state_dict(),
                 "y_power_max": y_power_max,
+                "best_lstm_params": best_params,
+                "optuna_best_value": best_optuna_value,
                 "train_losses": train_losses,
                 "val_losses": val_losses,
             },
@@ -233,6 +322,15 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
             raise FileNotFoundError(f"Missing LSTM checkpoint: {cfg['lstm_checkpoint_path']}")
 
         checkpoint = torch.load(cfg["lstm_checkpoint_path"], map_location=device, weights_only=False)
+        best_params = checkpoint.get("best_lstm_params", get_lstm_params_from_cfg(cfg))
+        best_optuna_value = checkpoint.get("optuna_best_value")
+        lstm_model = nn.LSTM(
+            input_size=lstm_inputs.shape[-1],
+            hidden_size=best_params["lstm_hidden"],
+            num_layers=best_params["lstm_layers"],
+            batch_first=True,
+        ).to(device)
+        reg_head = nn.Linear(best_params["lstm_hidden"], y_data.shape[-1]).to(device)
         lstm_model.load_state_dict(checkpoint["lstm_state_dict"])
         reg_head.load_state_dict(checkpoint["reg_head_state_dict"])
         y_power_max = checkpoint["y_power_max"]
@@ -261,6 +359,8 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
         "val_losses": val_losses,
         "mae": reg_mae,
         "rmse": reg_rmse,
+        "best_params": best_params,
+        "optuna_best_value": best_optuna_value,
     }
 
 def train_snn(snn_inputs, snn_targets, cfg, device):
@@ -605,6 +705,8 @@ def main(cfg=None):
     reg_true = None
     lstm_train_losses = []
     lstm_val_losses = []
+    best_lstm_params = None
+    best_lstm_value = None
 
     if cfg["train_mode"] == "SNN+LSTM":
         feat_per_sample = build_lstm_feature_matrix(
@@ -623,6 +725,14 @@ def main(cfg=None):
         reg_true = lstm_result["reg_true"]
         lstm_train_losses = lstm_result["train_losses"]
         lstm_val_losses = lstm_result["val_losses"]
+        best_lstm_params = lstm_result["best_params"]
+        best_lstm_value = lstm_result["optuna_best_value"]
+
+        if best_lstm_params is not None:
+            print("\nLSTM Parameters Used:")
+            print(best_lstm_params)
+        if best_lstm_value is not None:
+            print(f"Optuna best objective: {best_lstm_value:.6f}")
 
         if cfg["run_mode"] in ["test", "both"]:
             print("\nRegression Metrics:")
@@ -650,8 +760,12 @@ def main(cfg=None):
     if cfg["run_mode"] == "train":
         print("Training completed and checkpoints saved. Skipping evaluation/plots in train-only mode.")
 
-#######################################################################################################################
-# Run Code
-#######################################################################################################################
+    return {
+        "snn_result": snn_result,
+        "lstm_result": lstm_result if cfg["train_mode"] == "SNN+LSTM" else None,
+        "best_lstm_params": best_lstm_params,
+        "best_lstm_value": best_lstm_value,
+    }
+
 if __name__ == "__main__":
-    main()
+    main(get_config_default())
