@@ -34,8 +34,8 @@ def get_config_default():
     return {
         # Data selection.
         "mat_file": "data/redd3HF.mat",
-        "dev_ids": -1,  # Use -1 to select all devices; otherwise specify a list of device indices.
-        "nt_max": 100000,
+        "dev_ids": [5, 7, 11],  # Use -1 to select all devices; otherwise specify a list of device indices.
+        "nt_max": -1,  # Maximum number of time steps/samples to load; -1 for no limit.
         "threshold": 50.0,
 
         # Execution mode.
@@ -43,8 +43,8 @@ def get_config_default():
         # "test": load checkpoints and evaluate only.
         # "both": fit, save, and evaluate in the same run.
         "run_mode": "both",
-        "snn_checkpoint_path": "smallSNN_snn.pt",
-        "lstm_checkpoint_path": "smallSNN_lstm.pt",
+        "snn_checkpoint_path": "mdl/smallSNN_snn.pt",
+        "lstm_checkpoint_path": "mdl/smallSNN_lstm.pt",
 
         # SNN input representation.
         # `n_harmonics` keeps only the first low-frequency FFT bins for the SNN.
@@ -56,20 +56,21 @@ def get_config_default():
         # Pipeline mode.
         # "SNN" trains only the classifier.
         # "SNN+LSTM" adds the regression stage on top of predicted device states.
-        "train_mode": "SNN+LSTM",
+        # "LSTM" trains only the regressor and is valid with harmonics-only features.
+        "train_mode": "LSTM",
 
         # LSTM feature construction.
-        # "harmonics": reduced FFT only.
+        # "harmonics": reduced FFT only; compatible with train_mode="LSTM".
         # "harmonics+state": reduced FFT + predicted binary device states.
         # "encoded+full_fft": full FFT + predicted states; this also forces
         # `num_steps` to the full FFT length inside main().
         "lstm_feature_mode": "harmonics",
         # Number of consecutive cycles/samples given to the LSTM as one sequence.
-        "lstm_n_cycles": 20,
+        "lstm_n_cycles": 60,
 
         # Shared training setup.
         "split": 0.8,
-        "batch_size": 256,
+        "batch_size": 32,
 
         # SNN hyper-parameters.
         "snn_hidden": 64,
@@ -80,7 +81,7 @@ def get_config_default():
 
         # LSTM hyper-parameters.
         "lstm_hidden": 64,
-        "lstm_layers": 1,
+        "lstm_layers": 3,
         "lstm_epochs": 30,
         "lstm_lr": 1e-3,
         "lstm_patience": 10,
@@ -127,6 +128,69 @@ def load_data(mat_file, id_selector=-1, max_len=10000):
         y_data = y_data[:, 1 + id_selector]
 
     return x_data, y_data
+
+def prepare_checkpoint_paths(cfg):
+    os.makedirs("mdl", exist_ok=True)
+    for key in ["snn_checkpoint_path", "lstm_checkpoint_path"]:
+        cfg[key] = os.path.join("mdl", os.path.basename(cfg[key]))
+    return cfg
+
+def compute_scalar_regression_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    err = y_pred - y_true
+
+    mse = float(np.mean(err ** 2))
+    rmse = float(np.sqrt(mse))
+    mae = float(np.mean(np.abs(err)))
+    mean_err = float(np.mean(err))
+    max_err = float(np.max(np.abs(err)))
+
+    true_mean = float(np.mean(y_true))
+    ss_tot = float(np.sum((y_true - true_mean) ** 2))
+    ss_res = float(np.sum(err ** 2))
+    if ss_tot > 1e-12:
+        r2 = float(1.0 - ss_res / ss_tot)
+    else:
+        r2 = 1.0 if ss_res <= 1e-12 else float("nan")
+
+    mask = np.abs(y_true) > 1e-8
+    if np.any(mask):
+        mape = float(np.mean(np.abs(err[mask] / y_true[mask])))
+    else:
+        mape = float("nan")
+
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "mean_err": mean_err,
+        "r2": r2,
+        "mape": mape,
+        "max_err": max_err,
+    }
+
+def compute_regression_metrics(reg_true, reg_pred, dev_ids):
+    metrics = compute_scalar_regression_metrics(reg_true, reg_pred)
+    total_metrics = compute_scalar_regression_metrics(reg_true.sum(axis=1), reg_pred.sum(axis=1))
+
+    per_appliance_metrics = []
+    for idx, dev_id in enumerate(dev_ids):
+        dev_metrics = compute_scalar_regression_metrics(reg_true[:, idx], reg_pred[:, idx])
+        dev_metrics["device_id"] = dev_id
+        per_appliance_metrics.append(dev_metrics)
+
+    return metrics, total_metrics, per_appliance_metrics
+
+def print_metric_block(title, metrics, indent=""):
+    print(f"{indent}{title}")
+    print(f"{indent}  RMSE:      {metrics['rmse']:.4f}")
+    print(f"{indent}  MSE:       {metrics['mse']:.4f}")
+    print(f"{indent}  MAE:       {metrics['mae']:.4f}")
+    print(f"{indent}  Mean Err:  {metrics['mean_err']:.4f}")
+    print(f"{indent}  R2:        {metrics['r2']:.4f}" if not np.isnan(metrics["r2"]) else f"{indent}  R2:        N/A")
+    print(f"{indent}  MAPE:      {metrics['mape']:.2%}" if not np.isnan(metrics["mape"]) else f"{indent}  MAPE:      N/A (true=0)")
+    print(f"{indent}  Max Error: {metrics['max_err']:.4f}")
 
 def build_lstm_feature_matrix(feature_mode, v_fft_reduced_norm, i_fft_reduced_norm, v_fft_full_norm, i_fft_full_norm, pred_states):
     # Build one feature vector per cycle/sample before temporal windowing.
@@ -349,16 +413,18 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
 
     reg_pred = reg_pred_norm * y_power_max
     reg_true = y_data[split_idx:]
-    reg_mae = np.mean(np.abs(reg_pred - reg_true))
-    reg_rmse = np.sqrt(np.mean((reg_pred - reg_true) ** 2))
+    reg_metrics, total_metrics, per_appliance_metrics = compute_regression_metrics(reg_true, reg_pred, cfg["dev_ids"])
 
     return {
         "reg_pred": reg_pred,
         "reg_true": reg_true,
         "train_losses": train_losses,
         "val_losses": val_losses,
-        "mae": reg_mae,
-        "rmse": reg_rmse,
+        "metrics": reg_metrics,
+        "total_metrics": total_metrics,
+        "per_appliance_metrics": per_appliance_metrics,
+        "mae": reg_metrics["mae"],
+        "rmse": reg_metrics["rmse"],
         "best_params": best_params,
         "optuna_best_value": best_optuna_value,
     }
@@ -512,69 +578,82 @@ def plot_results(
     reg_pred,
     reg_true,
 ):
-    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=False)
-    axes[0].plot(snn_train_losses, label="Train")
-    axes[0].plot(snn_val_losses, label="Val")
-    axes[0].set_title("SNN Convergence")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("BCE Loss")
-    axes[0].legend()
-    axes[0].grid(True)
+    show_snn = len(snn_train_losses) > 0 or len(snn_val_losses) > 0
+    show_lstm = len(lstm_train_losses) > 0 or len(lstm_val_losses) > 0
 
-    if len(lstm_train_losses) > 0:
-        axes[1].plot(lstm_train_losses, label="Train")
-        axes[1].plot(lstm_val_losses, label="Val")
-        axes[1].set_title("LSTM Convergence")
-        axes[1].set_xlabel("Epoch")
-        axes[1].set_ylabel("MSE Loss (norm)")
-        axes[1].legend()
-        axes[1].grid(True)
-    else:
-        axes[1].set_visible(False)
-    plt.tight_layout()
-    plt.show()
+    if show_snn or show_lstm:
+        n_rows = int(show_snn) + int(show_lstm)
+        fig, axes = plt.subplots(n_rows, 1, figsize=(12, 3 * n_rows), sharex=False)
+        if n_rows == 1:
+            axes = [axes]
 
-    val_len = val_targets.shape[0]
-    time_axis = np.arange(val_len)
-    p_act_val = p_agg[split_idx:split_idx + val_len]
-    p_sum_val = (val_preds.numpy() * y_data[split_idx:split_idx + val_len]).sum(axis=1)
-    i_fft_val = i_fft_reduced_log[split_idx:split_idx + val_len, :]
-    lif_time = np.arange(mem_sample.shape[0])
-    s_pred_val = val_preds.numpy().sum(axis=1)
-    s_true_val = val_targets.numpy().sum(axis=1)
+        axis_idx = 0
+        if show_snn:
+            axes[axis_idx].plot(snn_train_losses, label="Train")
+            axes[axis_idx].plot(snn_val_losses, label="Val")
+            axes[axis_idx].set_title("SNN Convergence")
+            axes[axis_idx].set_xlabel("Epoch")
+            axes[axis_idx].set_ylabel("BCE Loss")
+            axes[axis_idx].legend()
+            axes[axis_idx].grid(True)
+            axis_idx += 1
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=False)
-    axes[0].plot(time_axis, p_act_val, label=r"$P_{agg}$")
-    axes[0].plot(time_axis, p_sum_val, label=r"$P_{app}$")
-    axes[0].set_ylabel("Power (W)")
-    axes[0].set_title("Aggregated Power and Summed Node Power")
-    axes[0].legend()
-    axes[0].grid(True)
-    axes[0].set_xticklabels([])
+        if show_lstm:
+            axes[axis_idx].plot(lstm_train_losses, label="Train")
+            axes[axis_idx].plot(lstm_val_losses, label="Val")
+            axes[axis_idx].set_title("LSTM Convergence")
+            axes[axis_idx].set_xlabel("Epoch")
+            axes[axis_idx].set_ylabel("MSE Loss (norm)")
+            axes[axis_idx].legend()
+            axes[axis_idx].grid(True)
 
-    axes[1].imshow(i_fft_val.T, aspect="auto", origin="lower", cmap="viridis")
-    axes[1].set_ylabel("Harmonic number (f/fel)")
-    axes[1].set_title("Input Current Harmonics")
-    axes[1].set_xticklabels([])
+        plt.tight_layout()
+        plt.show()
 
-    axes[2].plot(lif_time, mem_sample)
-    axes[2].plot(lif_time, np.ones_like(lif_time), linestyle="--")
-    axes[2].set_ylabel("Voltage (V)")
-    axes[2].set_title("LIF Membrane Potential")
-    axes[2].grid(True)
-    axes[2].set_xticklabels([])
+    if val_targets is not None and val_preds is not None and mem_sample is not None:
+        val_len = val_targets.shape[0]
+        time_axis = np.arange(val_len)
+        p_act_val = p_agg[split_idx:split_idx + val_len]
+        p_sum_val = (val_preds.numpy() * y_data[split_idx:split_idx + val_len]).sum(axis=1)
+        i_fft_val = i_fft_reduced_log[split_idx:split_idx + val_len, :]
+        lif_time = np.arange(mem_sample.shape[0])
+        s_pred_val = val_preds.numpy().sum(axis=1)
+        s_true_val = val_targets.numpy().sum(axis=1)
 
-    axes[3].plot(time_axis, s_pred_val, label=r"$S_{pred}$")
-    axes[3].plot(time_axis, s_true_val, label=r"$S_{true}$")
-    axes[3].set_ylabel("State (-)")
-    axes[3].set_xlabel("Time (sample)")
-    axes[3].set_title("LIF Output vs. Ground Truth")
-    axes[3].legend()
-    axes[3].grid(True)
-    plt.tight_layout()
-    plt.show()
+        fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=False)
+        axes[0].plot(time_axis, p_act_val, label=r"$P_{agg}$")
+        axes[0].plot(time_axis, p_sum_val, label=r"$P_{app}$")
+        axes[0].set_ylabel("Power (W)")
+        axes[0].set_title("Aggregated Power and Summed Node Power")
+        axes[0].legend()
+        axes[0].grid(True)
+        axes[0].set_xticklabels([])
+
+        axes[1].imshow(i_fft_val.T, aspect="auto", origin="lower", cmap="viridis")
+        axes[1].set_ylabel("Harmonic number (f/fel)")
+        axes[1].set_title("Input Current Harmonics")
+        axes[1].set_xticklabels([])
+
+        axes[2].plot(lif_time, mem_sample)
+        axes[2].plot(lif_time, np.ones_like(lif_time), linestyle="--")
+        axes[2].set_ylabel("Voltage (V)")
+        axes[2].set_title("LIF Membrane Potential")
+        axes[2].grid(True)
+        axes[2].set_xticklabels([])
+
+        axes[3].plot(time_axis, s_pred_val, label=r"$S_{pred}$")
+        axes[3].plot(time_axis, s_true_val, label=r"$S_{true}$")
+        axes[3].set_ylabel("State (-)")
+        axes[3].set_xlabel("Time (sample)")
+        axes[3].set_title("LIF Output vs. Ground Truth")
+        axes[3].legend()
+        axes[3].grid(True)
+        plt.tight_layout()
+        plt.show()
 
     if reg_pred is not None:
+        time_axis = np.arange(reg_true.shape[0])
+        reg_error = reg_pred - reg_true
         fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
         axes[0].plot(time_axis, reg_true.sum(axis=1), label="True total power")
         axes[0].plot(time_axis, reg_pred.sum(axis=1), label="Pred total power")
@@ -584,11 +663,11 @@ def plot_results(
         axes[0].grid(True)
 
         for idx, dev_id in enumerate(cfg["dev_ids"]):
-            axes[1].plot(time_axis, reg_true[:, idx], linestyle="--", alpha=0.35)
-            axes[1].plot(reg_pred[:, idx], alpha=0.8, label=f"Dev {dev_id}" if idx < 8 else None)
-        axes[1].set_ylabel("Power (W)")
+            axes[1].plot(time_axis, reg_error[:, idx], alpha=0.8, label=f"Dev {dev_id}" if idx < 8 else None)
+        axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
+        axes[1].set_ylabel("Error (W)")
         axes[1].set_xlabel("Time (sample)")
-        axes[1].set_title("Per-Appliance Regression")
+        axes[1].set_title("Per-Appliance Regression Error")
         axes[1].grid(True)
         if len(cfg["dev_ids"]) <= 8:
             axes[1].legend()
@@ -630,9 +709,14 @@ class SmallSNN(nn.Module):
 def main(cfg=None):
     if cfg is None:
         cfg = get_config_default()
+    cfg = prepare_checkpoint_paths(cfg)
 
     if cfg["run_mode"] not in ["train", "test", "both"]:
         raise ValueError("cfg['run_mode'] must be 'train', 'test', or 'both'.")
+    if cfg["train_mode"] not in ["SNN", "SNN+LSTM", "LSTM"]:
+        raise ValueError("cfg['train_mode'] must be 'SNN', 'SNN+LSTM', or 'LSTM'.")
+    if cfg["train_mode"] == "LSTM" and cfg["lstm_feature_mode"] != "harmonics":
+        raise ValueError("train_mode='LSTM' requires lstm_feature_mode='harmonics' because no SNN state inputs are available.")
 
     x_data, y_all = load_data(cfg["mat_file"], id_selector=-1, max_len=cfg["nt_max"])
     if cfg["dev_ids"] == -1:
@@ -672,34 +756,46 @@ def main(cfg=None):
     i_fft_full_norm = i_fft_full_log / (np.max(np.abs(i_fft_full_log)) + 1e-8)
     v_fft_full_norm = v_fft_full_log / (np.max(np.abs(v_fft_full_log)) + 1e-8)
 
-    if cfg["encoding"] != "rate":
-        raise ValueError("Only rate encoding is implemented in this prototype.")
-
-    i_spikes = spikegen.rate(torch.from_numpy(i_fft_reduced_norm.astype(np.float32)), num_steps=num_steps)
-    v_spikes = spikegen.rate(torch.from_numpy(v_fft_reduced_norm.astype(np.float32)), num_steps=num_steps)
-    snn_inputs = torch.cat((v_spikes, i_spikes), dim=2).permute(1, 0, 2).float()
-    snn_targets = torch.from_numpy(binary_targets).float()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    split_idx = int(cfg["split"] * y_data.shape[0])
+    snn_result = None
+    preds_all = None
+    val_targets = None
+    val_preds = None
+    mem_sample = None
+    snn_train_losses = []
+    snn_val_losses = []
 
-    snn_result = train_snn(snn_inputs, snn_targets, cfg, device)
-    split_idx = snn_result["split_idx"]
-    preds_all = snn_result["preds_all"]
-    val_targets = snn_result["val_targets"]
-    val_preds = snn_result["val_preds"]
-    mem_sample = snn_result["mem_sample"]
-    snn_train_losses = snn_result["train_losses"]
-    snn_val_losses = snn_result["val_losses"]
+    if cfg["train_mode"] in ["SNN", "SNN+LSTM"]:
+        if cfg["encoding"] != "rate":
+            raise ValueError("Only rate encoding is implemented in this prototype.")
 
-    if cfg["run_mode"] in ["test", "both"]:
-        print("\nClassification Metrics:")
-        print(f"Accuracy:  {snn_result['accuracy']:.4f}")
-        print(f"Precision: {snn_result['precision']:.4f}")
-        print(f"Recall:    {snn_result['recall']:.4f}")
-        print(f"F1:        {snn_result['f1']:.4f}")
+        i_spikes = spikegen.rate(torch.from_numpy(i_fft_reduced_norm.astype(np.float32)), num_steps=num_steps)
+        v_spikes = spikegen.rate(torch.from_numpy(v_fft_reduced_norm.astype(np.float32)), num_steps=num_steps)
+        snn_inputs = torch.cat((v_spikes, i_spikes), dim=2).permute(1, 0, 2).float()
+        snn_targets = torch.from_numpy(binary_targets).float()
 
-        print("\nPer-Node Accuracy:")
-        for idx, acc in enumerate(snn_result["per_node_acc"]):
-            print(f"  Node {cfg['dev_ids'][idx]:2d}: {acc:.4f}")
+        snn_result = train_snn(snn_inputs, snn_targets, cfg, device)
+        split_idx = snn_result["split_idx"]
+        preds_all = snn_result["preds_all"]
+        val_targets = snn_result["val_targets"]
+        val_preds = snn_result["val_preds"]
+        mem_sample = snn_result["mem_sample"]
+        snn_train_losses = snn_result["train_losses"]
+        snn_val_losses = snn_result["val_losses"]
+
+        if cfg["run_mode"] in ["test", "both"]:
+            print("\nClassification Metrics:")
+            print(f"Accuracy:  {snn_result['accuracy']:.4f}")
+            print(f"Precision: {snn_result['precision']:.4f}")
+            print(f"Recall:    {snn_result['recall']:.4f}")
+            print(f"F1:        {snn_result['f1']:.4f}")
+
+            print("\nPer-Node Accuracy:")
+            for idx, acc in enumerate(snn_result["per_node_acc"]):
+                print(f"  Node {cfg['dev_ids'][idx]:2d}: {acc:.4f}")
+    else:
+        print("Skipping SNN stage because train_mode='LSTM' uses harmonics-only LSTM features.")
 
     reg_pred = None
     reg_true = None
@@ -707,15 +803,16 @@ def main(cfg=None):
     lstm_val_losses = []
     best_lstm_params = None
     best_lstm_value = None
+    lstm_result = None
 
-    if cfg["train_mode"] == "SNN+LSTM":
+    if cfg["train_mode"] in ["SNN+LSTM", "LSTM"]:
         feat_per_sample = build_lstm_feature_matrix(
             cfg["lstm_feature_mode"],
             v_fft_reduced_norm,
             i_fft_reduced_norm,
             v_fft_full_norm,
             i_fft_full_norm,
-            preds_all.numpy().astype(np.float32),
+            None if preds_all is None else preds_all.numpy().astype(np.float32),
         )
         lstm_seq = build_sliding_window(feat_per_sample, cfg["lstm_n_cycles"])
         lstm_inputs = torch.from_numpy(lstm_seq)
@@ -736,8 +833,12 @@ def main(cfg=None):
 
         if cfg["run_mode"] in ["test", "both"]:
             print("\nRegression Metrics:")
-            print(f"MAE:  {lstm_result['mae']:.4f}")
-            print(f"RMSE: {lstm_result['rmse']:.4f}")
+            print_metric_block("Global (all appliance outputs flattened)", lstm_result["metrics"])
+            print_metric_block("Total power (sum across appliances)", lstm_result["total_metrics"])
+
+            print("Per-Appliance Metrics:")
+            for dev_metrics in lstm_result["per_appliance_metrics"]:
+                print_metric_block(f"Device {dev_metrics['device_id']}", dev_metrics, indent="  ")
 
     if cfg["plotting"] and cfg["run_mode"] in ["test", "both"]:
         plot_results(
@@ -762,7 +863,7 @@ def main(cfg=None):
 
     return {
         "snn_result": snn_result,
-        "lstm_result": lstm_result if cfg["train_mode"] == "SNN+LSTM" else None,
+        "lstm_result": lstm_result if cfg["train_mode"] in ["SNN+LSTM", "LSTM"] else None,
         "best_lstm_params": best_lstm_params,
         "best_lstm_value": best_lstm_value,
     }
