@@ -66,11 +66,12 @@ def get_config_default():
         # `num_steps` to the full FFT length inside main().
         "lstm_feature_mode": "harmonics",
         # Number of consecutive cycles/samples given to the LSTM as one sequence.
-        "lstm_n_cycles": 60,
+        "lstm_n_cycles": 30,
 
         # Shared training setup.
-        "split": 0.8,
-        "batch_size": 32,
+        "split": 0.5,  # Fraction of data used for training; rest is for validation/testing.
+        "batch_size": 256,
+        "train_stride": 5,
 
         # SNN hyper-parameters.
         "snn_hidden": 64,
@@ -80,9 +81,9 @@ def get_config_default():
         "snn_patience": 10,
 
         # LSTM hyper-parameters.
-        "lstm_hidden": 64,
-        "lstm_layers": 3,
-        "lstm_epochs": 30,
+        "lstm_hidden": 32,
+        "lstm_layers": 2,
+        "lstm_epochs": 100,
         "lstm_lr": 1e-3,
         "lstm_patience": 10,
 
@@ -134,6 +135,87 @@ def prepare_checkpoint_paths(cfg):
     for key in ["snn_checkpoint_path", "lstm_checkpoint_path"]:
         cfg[key] = os.path.join("mdl", os.path.basename(cfg[key]))
     return cfg
+
+def to_numpy(data):
+    if data is None:
+        return None
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
+
+def flatten_array_for_csv(data, column_prefix):
+    array = to_numpy(data)
+    if array is None:
+        return None, None
+
+    if array.ndim == 0:
+        flat = array.reshape(1, 1)
+        headers = [column_prefix]
+    elif array.ndim == 1:
+        flat = array.reshape(-1, 1)
+        headers = [column_prefix]
+    else:
+        flat = array.reshape(array.shape[0], -1)
+        trailing_shape = array.shape[1:]
+        headers = []
+        for flat_idx in range(flat.shape[1]):
+            multi_idx = np.unravel_index(flat_idx, trailing_shape)
+            suffix = "_".join(str(idx) for idx in multi_idx)
+            headers.append(f"{column_prefix}_{suffix}")
+
+    return flat.astype(np.float32, copy=False), headers
+
+def save_array_csv(csv_path, data, column_prefix, sample_indices=None):
+    flat, headers = flatten_array_for_csv(data, column_prefix)
+    if flat is None:
+        return
+
+    if sample_indices is not None and flat.shape[0] == len(sample_indices):
+        flat = np.column_stack((np.asarray(sample_indices, dtype=np.int64), flat))
+        headers = ["sample_index"] + headers
+
+    np.savetxt(
+        csv_path,
+        flat,
+        delimiter=",",
+        header=",".join(headers),
+        comments="",
+        fmt="%.8g",
+    )
+
+def save_stage_results(stage_name, x_data, y_data, y_pred, sample_indices, extra_arrays=None):
+    os.makedirs("results", exist_ok=True)
+    payload = {
+        "X": to_numpy(x_data),
+        "y": to_numpy(y_data),
+        "y_pred": to_numpy(y_pred),
+        "sample_indices": np.asarray(sample_indices, dtype=np.int64),
+    }
+
+    if extra_arrays is not None:
+        for key, value in extra_arrays.items():
+            if value is not None:
+                payload[key] = to_numpy(value)
+
+    save_path = os.path.join("results", f"{stage_name}_stage_results.npz")
+    np.savez_compressed(save_path, **payload)
+    print(f"Saved {stage_name.upper()} stage raw results to {save_path}")
+
+    save_array_csv(os.path.join("results", f"{stage_name}_stage_X.csv"), payload["X"], "x", sample_indices)
+    save_array_csv(os.path.join("results", f"{stage_name}_stage_y.csv"), payload["y"], "y", sample_indices)
+    save_array_csv(os.path.join("results", f"{stage_name}_stage_y_pred.csv"), payload["y_pred"], "y_pred", sample_indices)
+
+    if extra_arrays is not None:
+        for key, value in extra_arrays.items():
+            value_np = to_numpy(value)
+            if value_np is None:
+                continue
+            extra_csv_path = os.path.join("results", f"{stage_name}_stage_{key}.csv")
+            extra_indices = sample_indices if value_np.ndim > 0 and value_np.shape[0] == len(sample_indices) else None
+            save_array_csv(extra_csv_path, value_np, key, extra_indices)
+
+    print(f"Saved {stage_name.upper()} stage CSV exports to results/{stage_name}_stage_*.csv")
+    return save_path
 
 def compute_scalar_regression_metrics(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
@@ -205,17 +287,26 @@ def build_lstm_feature_matrix(feature_mode, v_fft_reduced_norm, i_fft_reduced_no
 
     return feat_per_sample.astype(np.float32)
 
-def build_sliding_window(feature_matrix, window_size):
+def build_sliding_window(feature_matrix, window_size, stride=1, index_offset=0, return_indices=False):
     # Convert per-sample features into short sequences for the LSTM.
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+
     n_samples, feat_dim = feature_matrix.shape
+    sample_indices = np.arange(0, n_samples, stride, dtype=np.int64)
 
     if window_size <= 1:
-        return feature_matrix[:, None, :].astype(np.float32)
+        windows = feature_matrix[sample_indices][:, None, :].astype(np.float32)
+        if return_indices:
+            return windows, sample_indices + index_offset
+        return windows
 
     pad = np.zeros((window_size - 1, feat_dim), dtype=np.float32)
     feat_padded = np.concatenate((pad, feature_matrix), axis=0)
-    windows = np.stack([feat_padded[idx:idx + window_size] for idx in range(n_samples)], axis=0)
-    return windows.astype(np.float32)
+    windows = np.stack([feat_padded[idx:idx + window_size] for idx in sample_indices], axis=0).astype(np.float32)
+    if return_indices:
+        return windows, sample_indices + index_offset
+    return windows
 
 def get_lstm_params_from_cfg(cfg):
     return {
@@ -224,24 +315,24 @@ def get_lstm_params_from_cfg(cfg):
         "lstm_lr": cfg["lstm_lr"],
     }
 
-def fit_lstm_model(lstm_inputs, y_data, split_idx, lstm_params, batch_size, epochs, patience, device):
-    y_power_max = np.max(np.abs(y_data), axis=0, keepdims=True)
+def fit_lstm_model(train_inputs, train_targets, val_inputs, val_targets, y_scale_reference, lstm_params, batch_size, epochs, patience, device):
+    y_power_max = np.max(np.abs(y_scale_reference), axis=0, keepdims=True)
     y_power_max[y_power_max == 0] = 1.0
-    y_data_norm = y_data / y_power_max
+    train_targets_norm = train_targets / y_power_max
+    val_targets_norm = val_targets / y_power_max
 
-    reg_targets = torch.from_numpy(y_data_norm).float()
-    reg_train_dataset = TensorDataset(lstm_inputs[:split_idx], reg_targets[:split_idx])
-    reg_val_dataset = TensorDataset(lstm_inputs[split_idx:], reg_targets[split_idx:])
+    reg_train_dataset = TensorDataset(train_inputs, torch.from_numpy(train_targets_norm).float())
+    reg_val_dataset = TensorDataset(val_inputs, torch.from_numpy(val_targets_norm).float())
     reg_train_loader = DataLoader(reg_train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     reg_val_loader = DataLoader(reg_val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     lstm_model = nn.LSTM(
-        input_size=lstm_inputs.shape[-1],
+        input_size=train_inputs.shape[-1],
         hidden_size=lstm_params["lstm_hidden"],
         num_layers=lstm_params["lstm_layers"],
         batch_first=True,
     ).to(device)
-    reg_head = nn.Linear(lstm_params["lstm_hidden"], y_data.shape[-1]).to(device)
+    reg_head = nn.Linear(lstm_params["lstm_hidden"], train_targets.shape[-1]).to(device)
     reg_loss_fn = nn.MSELoss()
     reg_optimizer = torch.optim.Adam(list(lstm_model.parameters()) + list(reg_head.parameters()), lr=lstm_params["lstm_lr"])
 
@@ -307,7 +398,7 @@ def fit_lstm_model(lstm_inputs, y_data, split_idx, lstm_params, batch_size, epoc
         "best_val_loss": best_val_loss,
     }
 
-def optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device):
+def optimize_lstm_hyperparameters(lstm_inputs, y_data, cfg, device):
     if optuna is None:
         raise ImportError("Optuna is not installed. Install optuna or disable cfg['optimize_lstm'].")
 
@@ -318,9 +409,11 @@ def optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device):
             "lstm_lr": trial.suggest_float("lstm_lr", 1e-4, 1e-2, log=True),
         }
         fit_result = fit_lstm_model(
-            lstm_inputs,
-            y_data,
-            split_idx,
+            lstm_inputs["train_inputs"],
+            y_data["train_targets"],
+            lstm_inputs["val_inputs"],
+            y_data["val_targets"],
+            y_data["scale_targets"],
             lstm_params,
             cfg["batch_size"],
             cfg["optuna_epochs"],
@@ -333,7 +426,7 @@ def optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device):
     study.optimize(objective, n_trials=cfg["optuna_n_trials"])
     return study.best_params, study.best_value
 
-def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
+def train_lstm(train_inputs, train_targets, val_inputs, val_targets, scale_targets, cfg, device):
     train_losses = []
     val_losses = []
     run_mode = cfg["run_mode"]
@@ -342,16 +435,23 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
 
     if run_mode in ["train", "both"]:
         if cfg.get("optimize_lstm", 0):
-            best_params, best_optuna_value = optimize_lstm_hyperparameters(lstm_inputs, y_data, split_idx, cfg, device)
+            best_params, best_optuna_value = optimize_lstm_hyperparameters(
+                {"train_inputs": train_inputs, "val_inputs": val_inputs},
+                {"train_targets": train_targets, "val_targets": val_targets, "scale_targets": scale_targets},
+                cfg,
+                device,
+            )
             print(f"Optuna best LSTM params: {best_params}")
             print(f"Optuna best validation loss: {best_optuna_value:.6f}")
         else:
             best_params = get_lstm_params_from_cfg(cfg)
 
         fit_result = fit_lstm_model(
-            lstm_inputs,
-            y_data,
-            split_idx,
+            train_inputs,
+            train_targets,
+            val_inputs,
+            val_targets,
+            scale_targets,
             best_params,
             cfg["batch_size"],
             cfg["lstm_epochs"],
@@ -389,12 +489,12 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
         best_params = checkpoint.get("best_lstm_params", get_lstm_params_from_cfg(cfg))
         best_optuna_value = checkpoint.get("optuna_best_value")
         lstm_model = nn.LSTM(
-            input_size=lstm_inputs.shape[-1],
+            input_size=train_inputs.shape[-1],
             hidden_size=best_params["lstm_hidden"],
             num_layers=best_params["lstm_layers"],
             batch_first=True,
         ).to(device)
-        reg_head = nn.Linear(best_params["lstm_hidden"], y_data.shape[-1]).to(device)
+        reg_head = nn.Linear(best_params["lstm_hidden"], train_targets.shape[-1]).to(device)
         lstm_model.load_state_dict(checkpoint["lstm_state_dict"])
         reg_head.load_state_dict(checkpoint["reg_head_state_dict"])
         y_power_max = checkpoint["y_power_max"]
@@ -408,11 +508,11 @@ def train_lstm(lstm_inputs, y_data, split_idx, cfg, device):
     lstm_model.eval()
     reg_head.eval()
     with torch.no_grad():
-        lstm_out, _ = lstm_model(lstm_inputs[split_idx:].to(device))
+        lstm_out, _ = lstm_model(val_inputs.to(device))
         reg_pred_norm = reg_head(lstm_out[:, -1, :]).cpu().numpy()
 
     reg_pred = reg_pred_norm * y_power_max
-    reg_true = y_data[split_idx:]
+    reg_true = val_targets
     reg_metrics, total_metrics, per_appliance_metrics = compute_regression_metrics(reg_true, reg_pred, cfg["dev_ids"])
 
     return {
@@ -534,6 +634,7 @@ def train_snn(snn_inputs, snn_targets, cfg, device):
 
     val_targets = snn_targets[split_idx:]
     val_preds = preds_all[split_idx:]
+    val_probs = probs_all[split_idx:]
     y_true = val_targets.numpy().astype(int).ravel()
     y_pred = val_preds.numpy().astype(int).ravel()
 
@@ -552,6 +653,7 @@ def train_snn(snn_inputs, snn_targets, cfg, device):
         "preds_all": preds_all,
         "val_targets": val_targets,
         "val_preds": val_preds,
+        "val_probs": val_probs,
         "mem_sample": mem_sample,
         "train_losses": train_losses,
         "val_losses": val_losses,
@@ -717,6 +819,9 @@ def main(cfg=None):
         raise ValueError("cfg['train_mode'] must be 'SNN', 'SNN+LSTM', or 'LSTM'.")
     if cfg["train_mode"] == "LSTM" and cfg["lstm_feature_mode"] != "harmonics":
         raise ValueError("train_mode='LSTM' requires lstm_feature_mode='harmonics' because no SNN state inputs are available.")
+    cfg["train_stride"] = int(cfg.get("train_stride", 1))
+    if cfg["train_stride"] < 1:
+        raise ValueError("cfg['train_stride'] must be >= 1.")
 
     x_data, y_all = load_data(cfg["mat_file"], id_selector=-1, max_len=cfg["nt_max"])
     if cfg["dev_ids"] == -1:
@@ -794,6 +899,18 @@ def main(cfg=None):
             print("\nPer-Node Accuracy:")
             for idx, acc in enumerate(snn_result["per_node_acc"]):
                 print(f"  Node {cfg['dev_ids'][idx]:2d}: {acc:.4f}")
+
+        save_stage_results(
+            "snn",
+            snn_inputs[split_idx:],
+            val_targets,
+            val_preds,
+            np.arange(split_idx, split_idx + val_targets.shape[0]),
+            extra_arrays={
+                "y_prob": snn_result["val_probs"],
+                "num_steps": np.array(num_steps, dtype=np.int64),
+            },
+        )
     else:
         print("Skipping SNN stage because train_mode='LSTM' uses harmonics-only LSTM features.")
 
@@ -814,9 +931,38 @@ def main(cfg=None):
             i_fft_full_norm,
             None if preds_all is None else preds_all.numpy().astype(np.float32),
         )
-        lstm_seq = build_sliding_window(feat_per_sample, cfg["lstm_n_cycles"])
-        lstm_inputs = torch.from_numpy(lstm_seq)
-        lstm_result = train_lstm(lstm_inputs, y_data, split_idx, cfg, device)
+        train_stride = int(cfg["train_stride"])
+        train_seq, train_indices = build_sliding_window(
+            feat_per_sample[:split_idx],
+            cfg["lstm_n_cycles"],
+            stride=train_stride,
+            return_indices=True,
+        )
+        eval_seq, eval_indices = build_sliding_window(
+            feat_per_sample,
+            cfg["lstm_n_cycles"],
+            stride=1,
+            return_indices=True,
+        )
+        eval_mask = eval_indices >= split_idx
+        eval_seq = eval_seq[eval_mask]
+        eval_indices = eval_indices[eval_mask]
+        print(
+            f"LSTM windowing: train windows={train_seq.shape[0]} (stride={train_stride}), "
+            f"eval windows={eval_seq.shape[0]} (stride=1)"
+        )
+
+        lstm_train_inputs = torch.from_numpy(train_seq)
+        lstm_eval_inputs = torch.from_numpy(eval_seq)
+        lstm_result = train_lstm(
+            lstm_train_inputs,
+            y_data[train_indices],
+            lstm_eval_inputs,
+            y_data[eval_indices],
+            y_data[:split_idx],
+            cfg,
+            device,
+        )
 
         reg_pred = lstm_result["reg_pred"]
         reg_true = lstm_result["reg_true"]
@@ -839,6 +985,19 @@ def main(cfg=None):
             print("Per-Appliance Metrics:")
             for dev_metrics in lstm_result["per_appliance_metrics"]:
                 print_metric_block(f"Device {dev_metrics['device_id']}", dev_metrics, indent="  ")
+
+        save_stage_results(
+            "lstm",
+            lstm_eval_inputs,
+            reg_true,
+            reg_pred,
+            eval_indices,
+            extra_arrays={
+                "train_stride": np.array(train_stride, dtype=np.int64),
+                "window_size": np.array(cfg["lstm_n_cycles"], dtype=np.int64),
+                "train_sample_indices": train_indices,
+            },
+        )
 
     if cfg["plotting"] and cfg["run_mode"] in ["test", "both"]:
         plot_results(
