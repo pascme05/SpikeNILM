@@ -72,6 +72,7 @@ def get_config_default():
         "split": 0.5,  # Fraction of data used for training; rest is for validation/testing.
         "batch_size": 256,
         "train_stride": 5,
+        "normalize_regression_targets": 1,
 
         # SNN hyper-parameters.
         "snn_hidden": 64,
@@ -97,6 +98,7 @@ def get_config_default():
 
         # Set to 0 for fast runs without figures.
         "plotting": 1,
+        "plot_regression_per_appliance": 1,
     }
 
 def get_config_fast():
@@ -313,11 +315,16 @@ def get_lstm_params_from_cfg(cfg):
         "lstm_hidden": cfg["lstm_hidden"],
         "lstm_layers": cfg["lstm_layers"],
         "lstm_lr": cfg["lstm_lr"],
+        "normalize_targets": cfg["normalize_regression_targets"],
     }
 
 def fit_lstm_model(train_inputs, train_targets, val_inputs, val_targets, y_scale_reference, lstm_params, batch_size, epochs, patience, device):
-    y_power_max = np.max(np.abs(y_scale_reference), axis=0, keepdims=True)
-    y_power_max[y_power_max == 0] = 1.0
+    if bool(lstm_params["normalize_targets"]):
+        y_power_max = np.max(np.abs(y_scale_reference), axis=0, keepdims=True)
+        y_power_max[y_power_max == 0] = 1.0
+    else:
+        y_power_max = np.ones((1, train_targets.shape[-1]), dtype=np.float32)
+
     train_targets_norm = train_targets / y_power_max
     val_targets_norm = val_targets / y_power_max
 
@@ -407,6 +414,7 @@ def optimize_lstm_hyperparameters(lstm_inputs, y_data, cfg, device):
             "lstm_hidden": trial.suggest_categorical("lstm_hidden", [32, 64, 128, 256]),
             "lstm_layers": trial.suggest_int("lstm_layers", 1, 2),
             "lstm_lr": trial.suggest_float("lstm_lr", 1e-4, 1e-2, log=True),
+            "normalize_targets": cfg["normalize_regression_targets"],
         }
         fit_result = fit_lstm_model(
             lstm_inputs["train_inputs"],
@@ -753,28 +761,28 @@ def plot_results(
         plt.tight_layout()
         plt.show()
 
-    if reg_pred is not None:
+    if reg_pred is not None and bool(cfg.get("plot_regression_per_appliance", 1)):
         time_axis = np.arange(reg_true.shape[0])
         reg_error = reg_pred - reg_true
-        fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-        axes[0].plot(time_axis, reg_true.sum(axis=1), label="True total power")
-        axes[0].plot(time_axis, reg_pred.sum(axis=1), label="Pred total power")
-        axes[0].set_ylabel("Power (W)")
-        axes[0].set_title("Summed Regression Power")
-        axes[0].legend()
-        axes[0].grid(True)
 
         for idx, dev_id in enumerate(cfg["dev_ids"]):
-            axes[1].plot(time_axis, reg_error[:, idx], alpha=0.8, label=f"Dev {dev_id}" if idx < 8 else None)
-        axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-        axes[1].set_ylabel("Error (W)")
-        axes[1].set_xlabel("Time (sample)")
-        axes[1].set_title("Per-Appliance Regression Error")
-        axes[1].grid(True)
-        if len(cfg["dev_ids"]) <= 8:
-            axes[1].legend()
-        plt.tight_layout()
-        plt.show()
+            fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+            axes[0].plot(time_axis, reg_true[:, idx], label="True power", linewidth=1.2)
+            axes[0].plot(time_axis, reg_pred[:, idx], label="Predicted power", linewidth=1.2, alpha=0.85)
+            axes[0].set_ylabel("Power (W)")
+            axes[0].set_title(f"Regression Power - Device {dev_id}")
+            axes[0].legend()
+            axes[0].grid(True)
+
+            axes[1].plot(time_axis, reg_error[:, idx], color="tab:red", linewidth=1.0)
+            axes[1].axhline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
+            axes[1].set_ylabel("Error (W)")
+            axes[1].set_xlabel("Time (sample)")
+            axes[1].set_title(f"Regression Error - Device {dev_id}")
+            axes[1].grid(True)
+
+            plt.tight_layout()
+            plt.show()
 
 #######################################################################################################################
 # Models
@@ -822,6 +830,8 @@ def main(cfg=None):
     cfg["train_stride"] = int(cfg.get("train_stride", 1))
     if cfg["train_stride"] < 1:
         raise ValueError("cfg['train_stride'] must be >= 1.")
+    cfg["normalize_regression_targets"] = int(cfg.get("normalize_regression_targets", 1))
+    cfg["plot_regression_per_appliance"] = int(cfg.get("plot_regression_per_appliance", 1))
 
     x_data, y_all = load_data(cfg["mat_file"], id_selector=-1, max_len=cfg["nt_max"])
     if cfg["dev_ids"] == -1:
@@ -974,6 +984,7 @@ def main(cfg=None):
         if best_lstm_params is not None:
             print("\nLSTM Parameters Used:")
             print(best_lstm_params)
+            print(f"Regression target normalization: {bool(best_lstm_params['normalize_targets'])}")
         if best_lstm_value is not None:
             print(f"Optuna best objective: {best_lstm_value:.6f}")
 
