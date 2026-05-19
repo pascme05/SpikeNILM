@@ -66,13 +66,13 @@ def get_config_default():
         # `num_steps` to the full FFT length inside main().
         "lstm_feature_mode": "harmonics",
         # Number of consecutive cycles/samples given to the LSTM as one sequence.
-        "lstm_n_cycles": 30,
+        "lstm_n_cycles": 180,
 
         # Shared training setup.
-        "split": 0.5,  # Fraction of data used for training; rest is for validation/testing.
+        "split": 0.7,  # Fraction of data used for training; rest is for validation/testing.
         "batch_size": 256,
         "train_stride": 5,
-        "normalize_regression_targets": 1,
+        "normalize_regression_targets": 0,
 
         # SNN hyper-parameters.
         "snn_hidden": 64,
@@ -82,11 +82,11 @@ def get_config_default():
         "snn_patience": 10,
 
         # LSTM hyper-parameters.
-        "lstm_hidden": 32,
-        "lstm_layers": 2,
+        "lstm_hidden": 64,
+        "lstm_layers": 3,
         "lstm_epochs": 100,
         "lstm_lr": 1e-3,
-        "lstm_patience": 10,
+        "lstm_patience": 15,
 
         # Optuna search for LSTM hyper-parameters.
         # When enabled, Optuna tunes the final LSTM training setup before the
