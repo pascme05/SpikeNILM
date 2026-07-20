@@ -23,13 +23,17 @@ Non-Intrusive Load Monitoring (NILM) pipeline for the REDD high-frequency datase
 # ==============================================================================
 # Internal
 # ==============================================================================
-from auxFnc import load_data, filter_output, binarize_output, downsample, extract_features, feature_deltas
+from auxFnc import load_data, filter_output, binarize_output, downsample, extract_features, feature_deltas, NNDataset, SNNModel, train_snn, test_snn
 from config import build_config_default
 
 # ==============================================================================
 # External
 # ==============================================================================
 import numpy as np
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch
 
 #######################################################################################################################
 # Helper Functions
@@ -63,6 +67,9 @@ def main(config):
     # ------------------------------------------
     # Machine Hardware
     # ------------------------------------------
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
 
     # ==============================================================================
     # STAGE 1: Data Loading and Pre-processing
@@ -110,11 +117,16 @@ def main(config):
     # ------------------------------------------
     # Split data
     # ------------------------------------------
+    # Init
     split_idx = int(dXf_t.shape[0] * config["SPLIT"])
+
+    # Train
     dXf_t_train = dXf_t[:split_idx]
     y_t_train = y_t[:split_idx]
     dy_t_train = dy_t[:split_idx]
     ds_t_train = ds_t[:split_idx]
+
+    # Test
     dXf_t_test = dXf_t[split_idx:]
     y_t_test = y_t[split_idx:]
     dy_t_test = dy_t[split_idx:]
@@ -145,10 +157,25 @@ def main(config):
     # ------------------------------------------
     # Init
     # ------------------------------------------
+    # Data
+    ds = NNDataset(dXf_t_train_norm, ds_t_train)
+    train_loader = DataLoader(ds, batch_size=config["SNN_BATCH_SIZE"], shuffle=True)
+
+    # Model
+    mdlSNN = SNNModel(F, 128, C).to(device)
+    opt = torch.optim.Adam(mdlSNN.parameters(), lr=config["SNN_LR"])
+    loss_fn = nn.BCELoss()
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
+    if config["SNN_DO_TRAIN"]:
+        mdlSNN = train_snn(mdlSNN, dXf_t_train_norm, ds_t_train, dXf_t_test_norm, ds_t_test, opt, loss_fn, config, device)
+
+    # ------------------------------------------
+    # Inference
+    # ------------------------------------------
+    y_pred = test_snn(mdlSNN, dXf_t_test_norm, config, device)
 
     # ==============================================================================
     # STAGE 4: LSTM Regression
