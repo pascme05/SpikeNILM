@@ -84,7 +84,7 @@ def downsample(X, y, rate=1):
         X_ds, y_ds: downsampled arrays
     """
     if rate is None or rate <= 1:
-        return X.copy(), y.copy()
+        return X, y
     return X[::rate].copy(), y[::rate].copy()
 
 
@@ -166,13 +166,22 @@ class NNDataset(Dataset):
 # FNC: Data Balancing
 # ==============================================================================
 def balance_sequences(X_seq, Y_seq, rng_seed=42):
+    """Undersample sequence rows by their joint binary target state."""
     rng = np.random.default_rng(rng_seed)
-    classes, counts = np.unique(Y_seq, return_counts=True)
+    targets = np.asarray(Y_seq)
+    if targets.ndim == 2:
+        class_ids = targets.astype(np.int64) @ (1 << np.arange(targets.shape[1]))
+    else:
+        class_ids = targets
+
+    classes, counts = np.unique(class_ids, return_counts=True)
+    if len(classes) < 2:
+        return X_seq, Y_seq
     min_count = counts.min()
     selected = []
 
     for class_id in classes:
-        class_indices = np.where(Y_seq == class_id)[0]
+        class_indices = np.where(class_ids == class_id)[0]
         selected.append(rng.choice(class_indices, size=min_count, replace=False))
 
     indices = np.sort(np.concatenate(selected))
@@ -258,6 +267,27 @@ def feature_deltas(X, mode="absolute"):
     return deltas.astype(np.float32, copy=False)
 
 
+def create_sequences(features, targets, sequence_length, stride=1):
+    """Create sliding feature windows and align each one to its final target."""
+    features = np.asarray(features, dtype=np.float32)
+    targets = np.asarray(targets, dtype=np.float32)
+    if features.ndim != 2:
+        raise ValueError("features must have shape [n_samples, n_features].")
+    if len(features) != len(targets):
+        raise ValueError("features and targets must contain the same number of samples.")
+    if sequence_length < 1 or sequence_length > len(features):
+        raise ValueError("sequence_length must be between 1 and the number of samples.")
+    if stride < 1:
+        raise ValueError("stride must be at least 1.")
+
+    windows = np.lib.stride_tricks.sliding_window_view(
+        features, window_shape=sequence_length, axis=0
+    )
+    windows = np.moveaxis(windows, -1, 1)[::stride].copy()
+    aligned_targets = targets[sequence_length - 1::stride].copy()
+    return windows, aligned_targets
+
+
 #######################################################################################################################
 # SNN Functions
 #######################################################################################################################
@@ -265,44 +295,59 @@ def feature_deltas(X, mode="absolute"):
 # SNN Model
 # ==============================================================================
 class SNNModel(nn.Module):
-    def __init__(self, Nh, hidden, C):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
         super().__init__()
-        self.fc1 = nn.Linear(Nh, hidden)
-        self.lif1 = snn.Leaky(beta=0.95)
-        self.fc2 = nn.Linear(hidden, C)
-        self.lif2 = snn.Leaky(beta=0.95)
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1.")
+
+        self.hidden_layers = nn.ModuleList()
+        self.hidden_lifs = nn.ModuleList()
+        layer_input_size = input_size
+        for _ in range(num_layers):
+            self.hidden_layers.append(nn.Linear(layer_input_size, hidden_size))
+            self.hidden_lifs.append(snn.Leaky(beta=beta))
+            layer_input_size = hidden_size
+        self.output_layer = nn.Linear(hidden_size, output_size)
+        self.output_lif = snn.Leaky(beta=beta)
 
     def forward(self, x):
-        mem1 = self.lif1.init_leaky()
-        mem2 = self.lif2.init_leaky()
+        if x.ndim != 3:
+            raise ValueError("SNN input must have shape [batch, sequence, features].")
+
+        hidden_memories = [lif.init_leaky() for lif in self.hidden_lifs]
+        output_memory = self.output_lif.init_leaky()
         spks = []
+        memories = []
         for t in range(x.shape[1]):
-            cur1 = self.fc1(x[:, t])
-            spk1, mem1 = self.lif1(cur1, mem1)
-            cur2 = self.fc2(spk1)
-            spk2, mem2 = self.lif2(cur2, mem2)
-            spks.append(spk2)
-        return torch.stack(spks, 1)
+            activations = x[:, t]
+            for index, (layer, lif) in enumerate(zip(self.hidden_layers, self.hidden_lifs)):
+                activations, hidden_memories[index] = lif(layer(activations), hidden_memories[index])
+            output_spikes, output_memory = self.output_lif(
+                self.output_layer(activations), output_memory
+            )
+            spks.append(output_spikes)
+            memories.append(output_memory)
+        return torch.stack(spks, dim=1), torch.stack(memories, dim=1)
 
 
 # ==============================================================================
 # Spike Encoding
 # ==============================================================================
 def encode(X, coding):
-    if spikegen is None:
-        raise ImportError("snntorch is required for encode_spikes but is not installed in this environment.")
-
-    if coding == 'current':
+    """Convert normalized sequence features to the configured SNN input coding."""
+    coding = coding.lower()
+    if coding in {"raw", "current"}:
         return X
 
-    if coding == 'rate':
-        return spikegen.rate(X)
+    if coding == "rate":
+        if spikegen is None:
+            return torch.bernoulli(X.clamp(0.0, 1.0))
+        return spikegen.rate(X.clamp(0.0, 1.0), time_var_input=True)
 
-    if coding == 'latency':
-        # returns (steps,batch,...); here use Nt encoding steps
-        return spikegen.latency(X, num_steps=X.shape[1])
+    if coding == "delta":
+        return torch.diff(X, dim=1, prepend=X[:, :1]).abs()
 
-    return None
+    raise ValueError(f"Unknown SNN_CODING: {coding}. Use 'raw', 'rate', or 'delta'.")
 
 
 # ==============================================================================
@@ -325,25 +370,36 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
     # ------------------------------------------
     # Data Prep
     # ------------------------------------------
-    snn_train_dataset = TensorDataset(X_train, y_train)
-    snn_val_dataset = TensorDataset(X_val, y_val)
-    snn_train_loader = DataLoader(snn_train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
-    snn_val_loader = DataLoader(snn_val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
+    snn_train_dataset = TensorDataset(
+        torch.as_tensor(X_train, dtype=torch.float32),
+        torch.as_tensor(y_train, dtype=torch.float32),
+    )
+    snn_val_dataset = TensorDataset(
+        torch.as_tensor(X_val, dtype=torch.float32),
+        torch.as_tensor(y_val, dtype=torch.float32),
+    )
+    loader_kwargs = {
+        "batch_size": cfg["SNN_BATCH_SIZE"],
+        "num_workers": cfg.get("NUM_WORKERS", 0),
+        "pin_memory": device.type == "cuda",
+    }
+    snn_train_loader = DataLoader(snn_train_dataset, shuffle=True, **loader_kwargs)
+    snn_val_loader = DataLoader(snn_val_dataset, shuffle=False, **loader_kwargs)
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
-    for epoch in range(cfg["EPOCHS"]):
+    for epoch in range(cfg["SNN_EPOCHS"]):
         # Init
         mdl.train()
         epoch_train_loss = 0.0
 
         # Loop over Batches
         for xb, yb in snn_train_loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad()
-            _, mem_rec = mdl(xb)
+            _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
             logits = mem_rec.mean(dim=1)
             loss = loss_fnc(logits, yb)
             loss.backward()
@@ -355,9 +411,9 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
         epoch_val_loss = 0.0
         with torch.no_grad():
             for xb, yb in snn_val_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                _, mem_rec = mdl(xb)
+                xb = xb.to(device, non_blocking=device.type == "cuda")
+                yb = yb.to(device, non_blocking=device.type == "cuda")
+                _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
                 logits = mem_rec.mean(dim=1)
                 epoch_val_loss += loss_fnc(logits, yb).item() * xb.size(0)
 
@@ -366,7 +422,7 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
         epoch_val_loss /= max(len(snn_val_dataset), 1)
         train_losses.append(epoch_train_loss)
         val_losses.append(epoch_val_loss)
-        print(f"SNN {epoch + 1}/{cfg['snn_epochs']} | Train: {epoch_train_loss:.4f} | Val: {epoch_val_loss:.4f}")
+        print(f"SNN {epoch + 1}/{cfg['SNN_EPOCHS']} | Train: {epoch_train_loss:.4f} | Val: {epoch_val_loss:.4f}")
 
         # Early Stopping
         if epoch_val_loss < best_val_loss:
@@ -375,7 +431,7 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
             no_improve = 0
         else:
             no_improve += 1
-            if no_improve >= cfg["snn_patience"]:
+            if no_improve >= cfg.get("SNN_PATIENCE", cfg["SNN_EPOCHS"]):
                 print(f"SNN early stopping at epoch {epoch + 1}")
                 break
 
@@ -393,17 +449,17 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
             "train_losses": train_losses,
             "val_losses": val_losses,
         },
-        cfg["snn_checkpoint_path"],
+        cfg["SNN_SAVE_PATH"],
     )
-    print(f"Saved SNN checkpoint to {cfg['snn_checkpoint_path']}")
+    print(f"Saved SNN checkpoint to {cfg['SNN_SAVE_PATH']}")
 
-    return mdl, train_losses, val_losses
+    return mdl
 
 
 # ==============================================================================
 # FNC: SNN Testing Loop
 # ==============================================================================
-def test_snn(mdl, X_test, cfg, device):
+def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
     # ------------------------------------------
     # Description
     # ------------------------------------------
@@ -411,13 +467,12 @@ def test_snn(mdl, X_test, cfg, device):
     # ------------------------------------------
     # Load Checkpoint
     # ------------------------------------------
-    if not os.path.exists(cfg["snn_checkpoint_path"]):
-        raise FileNotFoundError(f"Missing SNN checkpoint: {cfg['snn_checkpoint_path']}")
-
-    checkpoint = torch.load(cfg["snn_checkpoint_path"], map_location=device, weights_only=False)
-    mdl.load_state_dict(checkpoint["model_state_dict"])
-
-    print(f"Loaded SNN checkpoint from {cfg['snn_checkpoint_path']}")
+    if load_checkpoint:
+        if not os.path.exists(cfg["SNN_SAVE_PATH"]):
+            raise FileNotFoundError(f"Missing SNN checkpoint: {cfg['SNN_SAVE_PATH']}")
+        checkpoint = torch.load(cfg["SNN_SAVE_PATH"], map_location=device, weights_only=False)
+        mdl.load_state_dict(checkpoint["model_state_dict"])
+        print(f"Loaded SNN checkpoint from {cfg['SNN_SAVE_PATH']}")
 
     # ------------------------------------------
     # Eval
@@ -427,17 +482,21 @@ def test_snn(mdl, X_test, cfg, device):
 
     # Calc
     with torch.no_grad():
-        _, mem_all = mdl(X_test.to(device))
-        logits_all = mem_all.mean(dim=1).cpu()
-        probs_all = torch.sigmoid(logits_all)
-        y_pred = (probs_all >= 0.5).float()
+        X_test = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+        spk_all, mem_all = mdl(encode(X_test, cfg["SNN_CODING"]))
+        logits_all = mem_all.mean(dim=1)
+        probabilities = torch.sigmoid(logits_all)
+        if cfg.get("SNN_EVAL_MODE", "membrane") == "spike_count":
+            predictions = (spk_all.mean(dim=1) >= 0.5).to(torch.int64)
+        elif cfg.get("SNN_EVAL_MODE") == "spike_any":
+            predictions = (spk_all.any(dim=1)).to(torch.int64)
+        else:
+            predictions = (probabilities >= 0.5).to(torch.int64)
 
-        _, mem_sample = mdl(X_test.to(device))
-        mem_sample = mem_sample[0].cpu().numpy()
-
-    y_pred = y_pred.numpy().astype(int).ravel()
-
-    return y_pred
+    return {
+        "predictions": predictions.cpu().numpy(),
+        "probabilities": probabilities.cpu().numpy(),
+    }
 
 
 #######################################################################################################################

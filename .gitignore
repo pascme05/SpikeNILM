@@ -138,6 +138,8 @@ celerybeat.pid
 .env
 .envrc
 .venv
+best_snn_dev*.pt
+results/snn_predictions_dev*.png
 env/
 venv/
 ENV/
