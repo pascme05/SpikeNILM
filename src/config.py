@@ -11,7 +11,8 @@ def build_config_default():
         "NAME": "redd3HF",                                                      # Dataset name
         "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID)
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
-        "SPLIT": 0.95,                                                          # Fraction of samples used for training
+        "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
+        "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
         "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform

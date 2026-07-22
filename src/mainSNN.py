@@ -35,6 +35,7 @@ from auxFnc import (
     load_data,
     test_snn,
     train_snn,
+    check_hardware,
 )
 from config import build_config_default
 
@@ -43,7 +44,6 @@ from config import build_config_default
 # ===============================================================================
 from pathlib import Path
 import gc
-
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -77,29 +77,19 @@ def main(config):
     # Setup
     # ------------------------------------------
     config = dict(config)
+
+    # ------------------------------------------
+    # Path
+    # ------------------------------------------
     project_root = Path(__file__).resolve().parents[1]
-    if config["SNN_MODEL_TYPE"].lower() != "snn":
-        raise NotImplementedError("mainSNN currently implements SNN_MODEL_TYPE='snn' only.")
+    data_path = project_root / "data" / f"{config['NAME']}.mat"
+    config["SNN_SAVE_PATH"] = str(project_root / config["SNN_SAVE_PATH"].format(device_id=config["DEVICE_IDS"][0]))
+    config["REG_SAVE_PATH"] = str(project_root / config["REG_SAVE_PATH"].format(device_id=config["DEVICE_IDS"][0]))
 
     # ------------------------------------------
     # Machine Hardware
     # ------------------------------------------
-    # Device
-    requested_device = str(config.get("DEVICE", "auto")).lower()
-    if requested_device not in {"auto", "cpu", "cuda"}:
-        raise ValueError("DEVICE must be 'auto', 'cpu', or 'cuda'.")
-    if requested_device == "cpu":
-        device = torch.device("cpu")
-    elif torch.cuda.is_available():
-        gpu_index = int(config.get("GPU_INDEX", 0))
-        if gpu_index >= torch.cuda.device_count():
-            raise ValueError(f"GPU_INDEX={gpu_index} is not available.")
-        device = torch.device(f"cuda:{gpu_index}")
-    elif requested_device == "cuda":
-        raise RuntimeError("DEVICE='cuda' was requested but CUDA is unavailable.")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
+    device = check_hardware(config)
 
     # ===============================================================================
     # STAGE 1: Data Loading and Pre-processing
@@ -107,7 +97,6 @@ def main(config):
     # ------------------------------------------
     # Load Raw data
     # ------------------------------------------
-    data_path = project_root / "data" / f"{config['NAME']}.mat"
     X_raw, y_raw = load_data(data_path, config["DEVICE_IDS"], maxLen=config["MAX_LEN"])
     N = X_raw.shape[0]  # Samples
     W = X_raw.shape[1]  # Window size
@@ -118,7 +107,8 @@ def main(config):
     # Pre-Processing
     # ------------------------------------------
     # Output filtering
-    y_t = filter_output(y_raw, method=config.get("FILTER_METHOD", "moving_average"), window=config.get("FILTER_WINDOW", 5))
+    y_t = filter_output(y_raw, method=config.get("FILTER_METHOD", "moving_average"),
+                        window=config.get("FILTER_WINDOW", 5))
 
     # Convert binary states
     s_t = binarize_output(y_t, threshold=config.get("THRESHOLD", 50))
@@ -133,13 +123,9 @@ def main(config):
     # ------------------------------------------
     # Frequency Transform
     # ------------------------------------------
-    Xf_t, f_names = extract_features(
-        X_t,
-        n_harmonics=config["N_HARMONICS"],
-        selector=config.get("SNN_FEATURE_SELECTOR", config["FEATURE_SELECTOR"]),
-        return_names=True,
-    )
-    del X_raw, X_t, y_raw
+    Xf_t, f_names = extract_features(X_t, n_harmonics=config["N_HARMONICS"],
+                                     selector=config.get("SNN_FEATURE_SELECTOR", config["FEATURE_SELECTOR"]),
+                                     return_names=True)
     gc.collect()
 
     # ------------------------------------------
@@ -158,21 +144,35 @@ def main(config):
     # Split data
     # ------------------------------------------
     # Init
-    split_idx = int(dXf_t.shape[0] * config["SPLIT"])
+    split_idx_train = int(dXf_t.shape[0] * config["SPLIT_TRAIN"])
+    split_idx_val = int(dXf_t.shape[0] * config["SPLIT_VAL"])
 
     # Train
-    dXf_t_train = dXf_t[:split_idx]
-    y_t_train = y_t[:split_idx]
-    dy_t_train = dy_t[:split_idx]
-    s_t_train = s_t[:split_idx]
-    ds_t_train = ds_t[:split_idx]
+    X_raw_train = X_raw[split_idx_val:split_idx_train]
+    Xf_t_train = Xf_t[split_idx_val:split_idx_train]
+    dXf_t_train = dXf_t[split_idx_val:split_idx_train]
+    y_t_train = y_t[split_idx_val:split_idx_train]
+    dy_t_train = dy_t[split_idx_val:split_idx_train]
+    s_t_train = s_t[split_idx_val:split_idx_train]
+    ds_t_train = ds_t[split_idx_val:split_idx_train]
+
+    # Validation
+    X_raw_val = X_raw[:split_idx_val]
+    Xf_t_val = Xf_t[:split_idx_val]
+    dXf_t_val = dXf_t[:split_idx_val]
+    y_t_val = y_t[:split_idx_val]
+    dy_t_val = dy_t[:split_idx_val]
+    s_t_val = s_t[:split_idx_val]
+    ds_t_val = ds_t[:split_idx_val]
 
     # Test
-    dXf_t_test = dXf_t[split_idx:]
-    y_t_test = y_t[split_idx:]
-    dy_t_test = dy_t[split_idx:]
-    s_t_test = s_t[split_idx:]
-    ds_t_test = ds_t[split_idx:]
+    X_raw_test = X_raw[split_idx_train:]
+    Xf_t_test = Xf_t[split_idx_train:]
+    dXf_t_test = dXf_t[split_idx_train:]
+    y_t_test = y_t[split_idx_train:]
+    dy_t_test = dy_t[split_idx_train:]
+    s_t_test = s_t[split_idx_train:]
+    ds_t_test = ds_t[split_idx_train:]
 
     # ------------------------------------------
     # Normalization
@@ -181,34 +181,42 @@ def main(config):
     xmin = dXf_t_train.min(axis=0, keepdims=True)
     xmax = dXf_t_train.max(axis=0, keepdims=True)
     dXf_t_train_norm = (dXf_t_train - xmin) / (xmax - xmin + 1e-8)
+    dXf_t_val_norm = (dXf_t_val - xmin) / (xmax - xmin + 1e-8)
     dXf_t_test_norm = (dXf_t_test - xmin) / (xmax - xmin + 1e-8)
 
     # Output
     xmin = y_t_train.min(axis=0, keepdims=True)
     xmax = y_t_train.max(axis=0, keepdims=True)
     y_t_train_norm = (y_t_train - xmin) / (xmax - xmin + 1e-8)
+    y_t_val_norm = (y_t_val - xmin) / (xmax - xmin + 1e-8)
     y_t_test_norm = (y_t_test - xmin) / (xmax - xmin + 1e-8)
+
+    # ------------------------------------------
+    # Creat Targets
+    # ------------------------------------------
+    train_targets = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
+    val_targets = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
+    test_targets = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
+
+    # ------------------------------------------
+    # Windowing
+    # ------------------------------------------
+    dXf_t_train_norm, train_targets = create_sequences(dXf_t_train_norm, train_targets,
+                                                       sequence_length=config["SNN_SEQ_LEN"],
+                                                       stride=config["STRIDE"])
+    dXf_t_val_norm, val_targets = create_sequences(dXf_t_val_norm, val_targets, sequence_length=config["SNN_SEQ_LEN"],
+                                                   stride=config["STRIDE"])
+    dXf_t_test_norm, test_targets = create_sequences(dXf_t_test_norm, test_targets,
+                                                     sequence_length=config["SNN_SEQ_LEN"],
+                                                     stride=config["STRIDE"])
 
     # ------------------------------------------
     # Balance
     # ------------------------------------------
-    train_targets = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
-    test_targets = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
-    dXf_t_train_norm, train_targets = create_sequences(
-        dXf_t_train_norm,
-        train_targets,
-        sequence_length=config["SNN_SEQ_LEN"],
-        stride=config["STRIDE"],
-    )
-    dXf_t_test_norm, test_targets = create_sequences(
-        dXf_t_test_norm,
-        test_targets,
-        sequence_length=config["SNN_SEQ_LEN"],
-        stride=config["STRIDE"],
-    )
     if config["BALANCE_DATA"]:
         dXf_t_train_norm, train_targets = balance_sequences(dXf_t_train_norm, train_targets)
-    print(f"Training sequences: {len(dXf_t_train_norm):,}; validation sequences: {len(dXf_t_test_norm):,}")
+    print(f"Training sequences: {len(dXf_t_train_norm):,}; test sequences: {len(dXf_t_test_norm):,} ; "
+          f"validation sequences: {len(dXf_t_val_norm):,}")
 
     # ===============================================================================
     # STAGE 3: SNN Classification
@@ -216,19 +224,11 @@ def main(config):
     # ------------------------------------------
     # Init
     # ------------------------------------------
-    # Data
-
     # Model
-    config["SNN_SAVE_PATH"] = str(
-        project_root / config["SNN_SAVE_PATH"].format(device_id=config["DEVICE_IDS"][0])
-    )
-    mdlSNN = SNNModel(
-        input_size=dXf_t_train_norm.shape[-1],
-        hidden_size=config["SNN_HIDDEN_SIZE"],
-        output_size=C,
-        num_layers=config["SNN_NUM_LAYERS"],
-        beta=config["SNN_BETA"],
-    ).to(device)
+    mdlSNN = SNNModel(input_size=dXf_t_train_norm.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+                      num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
+
+    # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlSNN.parameters(), lr=config["SNN_LR"])
     loss_fn = nn.BCEWithLogitsLoss()
 
@@ -236,17 +236,8 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        mdlSNN = train_snn(
-            mdlSNN,
-            dXf_t_train_norm,
-            train_targets,
-            dXf_t_test_norm,
-            test_targets,
-            opt,
-            loss_fn,
-            config,
-            device,
-        )
+        mdlSNN = train_snn(mdlSNN, dXf_t_train_norm, train_targets, dXf_t_test_norm, test_targets, opt, loss_fn, config,
+                           device)
 
     # ------------------------------------------
     # Inference
@@ -297,6 +288,11 @@ def main(config):
     # ===============================================================================
     # STAGE 6: Plotting
     # ===============================================================================
+    # ------------------------------------------
+    # SNN
+    # ------------------------------------------
+    # TODO: Raw data and feature encoding (X_raw_test, Xf_t, dXf_t) + y value (y_t_test, s_t_test, ds_t_test)
+
     # if config["PLOT_SNN"]:
     output_dir = project_root / "results"
     output_dir.mkdir(exist_ok=True)
@@ -309,13 +305,7 @@ def main(config):
     fig.tight_layout()
     fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][0]}.png", dpi=150)
     plt.close(fig)
-
-    return {
-        "accuracy": accuracy,
-        "predictions": y_pred,
-        "targets": test_targets,
-        "probabilities": evaluation["probabilities"],
-    }
+    plt.show()
 
 
 #######################################################################################################################

@@ -43,6 +43,32 @@ except ImportError:
 
 
 #######################################################################################################################
+# General
+#######################################################################################################################
+# ==============================================================================
+# FNC: Machine hardware
+# ==============================================================================
+def check_hardware(config):
+    requested_device = str(config.get("DEVICE", "auto")).lower()
+    if requested_device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("DEVICE must be 'auto', 'cpu', or 'cuda'.")
+    if requested_device == "cpu":
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
+        gpu_index = int(config.get("GPU_INDEX", 0))
+        if gpu_index >= torch.cuda.device_count():
+            raise ValueError(f"GPU_INDEX={gpu_index} is not available.")
+        device = torch.device(f"cuda:{gpu_index}")
+    elif requested_device == "cuda":
+        raise RuntimeError("DEVICE='cuda' was requested but CUDA is unavailable.")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
+    return device
+
+
+#######################################################################################################################
 # Data Loading and Handling
 #######################################################################################################################
 # ==============================================================================
