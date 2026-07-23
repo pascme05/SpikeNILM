@@ -9,6 +9,7 @@ def build_config_default():
     return {
         # ── Dataset ──────────────────────────────────────────────────────────
         "NAME": "redd3HF",                                                      # Dataset name
+        "T_SAMPLING": 3,                                                        # Sequence-frame sampling period (s)
         "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID)
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
@@ -16,7 +17,7 @@ def build_config_default():
         "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
-        "FEATURE_SELECTOR": {
+        "REG_FEATURE_SELECTOR": {
             "voltage_harmonics": True,
             "current_harmonics": True,
             "voltage_stats": True,
@@ -27,23 +28,26 @@ def build_config_default():
             "voltage_harmonics": False,
             "current_harmonics": True,
             "voltage_stats": False,
-            "current_stats": True,
+            "current_stats": False,
             "power_stats": False,
         },
-        "RAW_INPUT_CHANNELS": ["voltage", "current"],                           # Raw mode selector: any subset of ['voltage', 'current']
+        "REG_INPUT_CHANNELS": ["voltage", "current"],                           # Raw mode selector: any subset of ['voltage', 'current']
         "SNN_RAW_INPUT_CHANNELS": ["current"],                                  # Raw SNN selector when USE_FEATURES=False
         "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
         "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
         "USE_DERIVATIVE": False,                                                 # True = predict state changes;  False = predict ON/OFF
         "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
-        "STRIDE": 5,                                                            # Sliding-window stride used during training
         "DEVICE": "auto",                                                       # 'auto' = prefer CUDA, otherwise CPU; can also force 'cuda' or 'cpu'
         "GPU_INDEX": 0,                                                         # CUDA device index when DEVICE resolves to GPU
         "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
 
+        # ── General Model Para  ──────────────────────────────────────────────
+        "WINDOW": 100,  # Number of AC cycles per input window
+        "STRIDE": 5,  # Sliding-window stride used during training
+
+
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "SNN_MODEL_TYPE": "snn",                                                    # Classifier type: 'snn' | 'cnn' | 'lstm'
-        "SNN_SEQ_LEN": 100,                                                         # Number of AC cycles per input window
         "SNN_HIDDEN_SIZE": 64,                                                      # Hidden layer width (neurons / channels)
         "SNN_NUM_LAYERS": 3,                                                        # Number of stacked layers
         "SNN_BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
@@ -58,7 +62,7 @@ def build_config_default():
         "SNN_OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
         "SNN_BATCH_SIZE": 1024,                                                     # Mini-batch size for training
         "SNN_LR": 1e-3,                                                             # Learning rate for Adam optimiser
-        "SNN_EPOCHS": 50,                                                           # Number of training epochs
+        "SNN_EPOCHS": 500,                                                           # Number of training epochs
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
@@ -82,7 +86,7 @@ def build_config_default():
         # ── Plotting ──────────────────────────────────────────────────────────
         # Disable plots during automated runs (e.g. Optuna sweeps) to save time.
         "PLOT_SNN": True,                                                       # Generate per-device SNN classification plots
-        "PLOT_REGRESSION": True,                                                # Generate per-device regression plots
+        "PLOT_REG": True,                                                # Generate per-device regression plots
         "PLOT_DEBUG_BATCH": True,                                              # Plot the first test batch input/output for model debugging
         "DEBUG_SAMPLE_INDEX": 0,                                                # Sample index inside the debug batch used for detailed views
         "DEBUG_BATCH_PLOT_SAMPLES": 24,                                         # Max number of batch samples shown in debug heatmaps

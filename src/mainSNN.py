@@ -45,6 +45,8 @@ from config import build_config_default
 from pathlib import Path
 import gc
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -102,6 +104,9 @@ def main(config):
     W = X_raw.shape[1]  # Window size
     F = X_raw.shape[2]  # Features
     C = y_raw.shape[1]  # Channels, aka devices
+    sampling_period = float(config["T_SAMPLING"])
+    time_sequence = np.arange(N, dtype=np.float64) * sampling_period
+    time_raw_cycles = time_sequence[:, None] + np.arange(W, dtype=np.float64) * sampling_period / W
 
     # ------------------------------------------
     # Pre-Processing
@@ -114,8 +119,29 @@ def main(config):
     s_t = binarize_output(y_t, threshold=config.get("THRESHOLD", 50))
 
     # Downsample data
-    X_t, y_t = downsample(X_raw, y_t, rate=config.get("DOWNSAMPLE", 1))
-    _, s_t = downsample(X_raw, s_t, rate=config.get("DOWNSAMPLE", 1))
+    downsample_rate = config.get("DOWNSAMPLE", 1)
+    X_t, y_t = downsample(X_raw, y_t, rate=downsample_rate)
+    _, s_t = downsample(X_raw, s_t, rate=downsample_rate)
+    time_sequence = time_sequence[::downsample_rate]
+    time_raw_cycles = time_raw_cycles[::downsample_rate]
+    time_raw = time_raw_cycles.reshape(-1)
+
+    # ------------------------------------------
+    # Normalization
+    # ------------------------------------------
+    # Init
+    split_idx_train = int(X_t.shape[0] * config["SPLIT_TRAIN"])
+    split_idx_val = int(X_t.shape[0] * config["SPLIT_VAL"])
+
+    # Input
+    xmin = X_t[split_idx_val:split_idx_train].min(axis=0, keepdims=True)
+    xmax = X_t[split_idx_val:split_idx_train].max(axis=0, keepdims=True)
+    X_t = (X_t - xmin) / (xmax - xmin + 1e-8)
+
+    # Output
+    ymin = y_t[split_idx_val:split_idx_train].min(axis=0, keepdims=True)
+    ymax = y_t[split_idx_val:split_idx_train].max(axis=0, keepdims=True)
+    y_t = (y_t - ymin) / (ymax - ymin + 1e-8)
 
     # ===============================================================================
     # STAGE 2: Feature Extraction
@@ -124,7 +150,7 @@ def main(config):
     # Frequency Transform
     # ------------------------------------------
     Xf_t, f_names = extract_features(X_t, n_harmonics=config["N_HARMONICS"],
-                                     selector=config.get("SNN_FEATURE_SELECTOR", config["FEATURE_SELECTOR"]),
+                                     selector=config.get("SNN_FEATURE_SELECTOR", config["REG_FEATURE_SELECTOR"]),
                                      return_names=True)
     gc.collect()
 
@@ -143,12 +169,10 @@ def main(config):
     # ------------------------------------------
     # Split data
     # ------------------------------------------
-    # Init
-    split_idx_train = int(dXf_t.shape[0] * config["SPLIT_TRAIN"])
-    split_idx_val = int(dXf_t.shape[0] * config["SPLIT_VAL"])
-
     # Train
-    X_raw_train = X_raw[split_idx_val:split_idx_train]
+    time_sequence_train = time_sequence[split_idx_val:split_idx_train]
+    time_raw_train = time_raw_cycles[split_idx_val:split_idx_train].reshape(-1)
+    X_raw_train = X_t[split_idx_val:split_idx_train]
     Xf_t_train = Xf_t[split_idx_val:split_idx_train]
     dXf_t_train = dXf_t[split_idx_val:split_idx_train]
     y_t_train = y_t[split_idx_val:split_idx_train]
@@ -157,7 +181,9 @@ def main(config):
     ds_t_train = ds_t[split_idx_val:split_idx_train]
 
     # Validation
-    X_raw_val = X_raw[:split_idx_val]
+    time_sequence_val = time_sequence[:split_idx_val]
+    time_raw_val = time_raw_cycles[:split_idx_val].reshape(-1)
+    X_raw_val = X_t[:split_idx_val]
     Xf_t_val = Xf_t[:split_idx_val]
     dXf_t_val = dXf_t[:split_idx_val]
     y_t_val = y_t[:split_idx_val]
@@ -166,7 +192,9 @@ def main(config):
     ds_t_val = ds_t[:split_idx_val]
 
     # Test
-    X_raw_test = X_raw[split_idx_train:]
+    time_sequence_test = time_sequence[split_idx_train:]
+    time_raw_test = time_raw_cycles[split_idx_train:].reshape(-1)
+    X_raw_test = X_t[split_idx_train:]
     Xf_t_test = Xf_t[split_idx_train:]
     dXf_t_test = dXf_t[split_idx_train:]
     y_t_test = y_t[split_idx_train:]
@@ -175,48 +203,32 @@ def main(config):
     ds_t_test = ds_t[split_idx_train:]
 
     # ------------------------------------------
-    # Normalization
-    # ------------------------------------------
-    # Input
-    xmin = dXf_t_train.min(axis=0, keepdims=True)
-    xmax = dXf_t_train.max(axis=0, keepdims=True)
-    dXf_t_train_norm = (dXf_t_train - xmin) / (xmax - xmin + 1e-8)
-    dXf_t_val_norm = (dXf_t_val - xmin) / (xmax - xmin + 1e-8)
-    dXf_t_test_norm = (dXf_t_test - xmin) / (xmax - xmin + 1e-8)
-
-    # Output
-    xmin = y_t_train.min(axis=0, keepdims=True)
-    xmax = y_t_train.max(axis=0, keepdims=True)
-    y_t_train_norm = (y_t_train - xmin) / (xmax - xmin + 1e-8)
-    y_t_val_norm = (y_t_val - xmin) / (xmax - xmin + 1e-8)
-    y_t_test_norm = (y_t_test - xmin) / (xmax - xmin + 1e-8)
-
-    # ------------------------------------------
     # Creat Targets
     # ------------------------------------------
-    train_targets = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
-    val_targets = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
-    test_targets = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
+    y_train_snn = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
+    y_val_snn = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
+    y_test_snn = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
 
     # ------------------------------------------
     # Windowing
     # ------------------------------------------
-    dXf_t_train_norm, train_targets = create_sequences(dXf_t_train_norm, train_targets,
-                                                       sequence_length=config["SNN_SEQ_LEN"],
-                                                       stride=config["STRIDE"])
-    dXf_t_val_norm, val_targets = create_sequences(dXf_t_val_norm, val_targets, sequence_length=config["SNN_SEQ_LEN"],
-                                                   stride=config["STRIDE"])
-    dXf_t_test_norm, test_targets = create_sequences(dXf_t_test_norm, test_targets,
-                                                     sequence_length=config["SNN_SEQ_LEN"],
-                                                     stride=config["STRIDE"])
+    dXf_w_train, y_w_train = create_sequences(dXf_t_train, y_t_train,
+                                      sequence_length=config["WINDOW"],
+                                      stride=config["STRIDE"])
+    dXf_w_val, y_w_val = create_sequences(dXf_t_val, y_t_val,
+                                    sequence_length=config["WINDOW"],
+                                    stride=config["STRIDE"])
+    dXf_w_test, y_w_test = create_sequences(dXf_t_test, y_t_test,
+                                     sequence_length=config["WINDOW"],
+                                     stride=config["STRIDE"])
 
     # ------------------------------------------
     # Balance
     # ------------------------------------------
     if config["BALANCE_DATA"]:
-        dXf_t_train_norm, train_targets = balance_sequences(dXf_t_train_norm, train_targets)
-    print(f"Training sequences: {len(dXf_t_train_norm):,}; test sequences: {len(dXf_t_test_norm):,} ; "
-          f"validation sequences: {len(dXf_t_val_norm):,}")
+        dXf_w_train_norm, y_w_train = balance_sequences(dXf_w_train, y_w_train)
+    print(f"Training sequences: {len(dXf_w_train):,}; test sequences: {len(dXf_w_test):,} ; "
+          f"validation sequences: {len(dXf_w_val):,}")
 
     # ===============================================================================
     # STAGE 3: SNN Classification
@@ -225,7 +237,7 @@ def main(config):
     # Init
     # ------------------------------------------
     # Model
-    mdlSNN = SNNModel(input_size=dXf_t_train_norm.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+    mdlSNN = SNNModel(input_size=dXf_t_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
                       num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
 
     # Loss Fnc and Optimizer
@@ -236,13 +248,12 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        mdlSNN = train_snn(mdlSNN, dXf_t_train_norm, train_targets, dXf_t_test_norm, test_targets, opt, loss_fn, config,
-                           device)
+        mdlSNN = train_snn(mdlSNN, dXf_t_train, y_train_snn, dXf_t_val, y_val_snn, opt, loss_fn, config, device)
 
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = test_snn(mdlSNN, dXf_t_test_norm, config, device, load_checkpoint=True)
+    evaluation = test_snn(mdlSNN, dXf_t_test, config, device, load_checkpoint=True)
     y_pred = evaluation["predictions"]
 
     # ===============================================================================
@@ -282,7 +293,7 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    accuracy = float((y_pred == test_targets.astype(int)).mean())
+    accuracy = float((y_pred == y_test_snn.astype(int)).mean())
     print(f"Validation accuracy: {accuracy:.4f}")
 
     # ===============================================================================
@@ -291,21 +302,101 @@ def main(config):
     # ------------------------------------------
     # SNN
     # ------------------------------------------
-    # TODO: Raw data and feature encoding (X_raw_test, Xf_t, dXf_t) + y value (y_t_test, s_t_test, ds_t_test)
+    if config["PLOT_SNN"]:
+        output_dir = project_root / "results"
+        output_dir.mkdir(exist_ok=True)
 
-    # if config["PLOT_SNN"]:
-    output_dir = project_root / "results"
-    output_dir.mkdir(exist_ok=True)
-    sample_count = min(1_000, len(test_targets))
-    fig, axis = plt.subplots(figsize=(12, 3))
-    axis.plot(test_targets[:sample_count, 0], label="target", linewidth=1.2)
-    axis.plot(y_pred[:sample_count, 0], label="prediction", linewidth=1.0, alpha=0.8)
-    axis.set(xlabel="Test sequence", ylabel="ON state", ylim=(-0.1, 1.1))
-    axis.legend(loc="upper right")
-    fig.tight_layout()
-    fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][0]}.png", dpi=150)
-    plt.close(fig)
-    plt.show()
+        feature_magnitudes = np.abs(Xf_t_test)
+        encoding_magnitudes = np.abs(dXf_t_test)
+        positive_magnitudes = np.concatenate((feature_magnitudes.ravel(), encoding_magnitudes.ravel()))
+        positive_magnitudes = positive_magnitudes[positive_magnitudes > 0]
+        color_min = positive_magnitudes.min()
+        color_max = max(positive_magnitudes.max(), color_min * 10)
+        feature_norm = LogNorm(vmin=color_min, vmax=color_max)
+        feature_cmap = "viridis"
+
+        fig, axes = plt.subplots(3, 2, figsize=(18, 12), constrained_layout=True)
+        raw_axis = axes[0, 0]
+        feature_axis = axes[1, 0]
+        delta_axis = axes[2, 0]
+        power_axis = axes[0, 1]
+        state_axis = axes[1, 1]
+        prediction_axis = axes[2, 1]
+
+        raw_axis.plot(time_raw_test, X_raw_test[:, :, 0].reshape(-1), color="tab:blue", linewidth=0.3,
+                      rasterized=True, label="voltage")
+        current_axis = raw_axis.twinx()
+        current_axis.plot(time_raw_test, X_raw_test[:, :, 1].reshape(-1), color="tab:orange", linewidth=0.3,
+                          rasterized=True, label="current")
+        raw_axis.set(title="Raw Voltage and Current (Complete Test Set)", xlabel="Time (s)", ylabel="Voltage")
+        current_axis.set_ylabel("Current")
+        raw_axis.legend(loc="upper left")
+        current_axis.legend(loc="upper right")
+
+        feature_image = feature_axis.imshow(
+            feature_magnitudes.T,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            cmap=feature_cmap,
+            norm=feature_norm,
+            extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+        )
+        feature_axis.set(title="Extracted Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
+        feature_axis.set_yticks(range(len(f_names)), f_names)
+        fig.colorbar(feature_image, ax=feature_axis, pad=0.01, label="Magnitude (log scale)")
+
+        delta_image = delta_axis.imshow(
+            encoding_magnitudes.T,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            cmap=feature_cmap,
+            norm=feature_norm,
+            extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+        )
+        delta_axis.set(title="SNN Input Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
+        delta_axis.set_yticks(range(len(f_names)), f_names)
+        fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
+
+        power_raw_test = np.repeat(y_t_test[:, 0], W)
+        state_raw_test = np.repeat(s_t_test[:, 0], W)
+        delta_state_raw_test = np.repeat(ds_t_test[:, 0], W)
+        power_axis.plot(time_raw_test, power_raw_test, color="tab:green", linewidth=0.5, rasterized=True, label="power")
+        power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)", ylabel="Power (W)")
+        power_axis.legend(loc="upper right")
+
+        state_axis.step(time_raw_test, state_raw_test, where="post", color="tab:blue", linewidth=0.5,
+                        rasterized=True, label="ON/OFF state")
+        state_axis.step(time_raw_test, delta_state_raw_test, where="post", color="tab:orange", linewidth=0.5,
+                        rasterized=True, label="state change")
+        state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)", ylabel="State",
+                       ylim=(-0.1, 1.1))
+        state_axis.legend(loc="upper right")
+
+        prediction_indices = np.arange(config["SNN_SEQ_LEN"] - 1, len(y_t_test), config["STRIDE"])
+        prediction_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
+        probability_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
+        prediction_sequence[prediction_indices] = y_pred[:, 0]
+        probability_sequence[prediction_indices] = evaluation["probabilities"][:, 0]
+        last_prediction_indices = np.searchsorted(prediction_indices, np.arange(len(y_t_test)), side="right") - 1
+        valid_predictions = last_prediction_indices >= 0
+        prediction_sequence[valid_predictions] = y_pred[last_prediction_indices[valid_predictions], 0]
+        probability_sequence[valid_predictions] = evaluation["probabilities"][last_prediction_indices[valid_predictions], 0]
+        prediction_raw_test = np.repeat(prediction_sequence, W)
+        probability_raw_test = np.repeat(probability_sequence, W)
+        prediction_axis.step(time_raw_test, np.repeat(s_t_test[:, 0], W), where="post", color="tab:blue", linewidth=0.5,
+                             rasterized=True, label="target")
+        prediction_axis.step(time_raw_test, prediction_raw_test, where="post", color="tab:red", linewidth=0.5,
+                             rasterized=True, label="prediction")
+        prediction_axis.plot(time_raw_test, probability_raw_test, color="tab:purple", linewidth=0.5, alpha=0.7,
+                             rasterized=True, label="membrane probability")
+        prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
+                            ylim=(-0.1, 1.1))
+        prediction_axis.legend(loc="upper right")
+
+        fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][0]}.png", dpi=150)
+        plt.close(fig)
 
 
 #######################################################################################################################

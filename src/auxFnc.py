@@ -368,7 +368,10 @@ def encode(X, coding):
     if coding == "rate":
         if spikegen is None:
             return torch.bernoulli(X.clamp(0.0, 1.0))
-        return spikegen.rate(X.clamp(0.0, 1.0), time_var_input=True)
+        return spikegen.rate(X.clamp(0.0, 1.0), num_steps=100)
+
+    if coding == "latency":
+        return spikegen.latency(X.clamp(0.0, 1.0), num_steps=100, normalize=True, linear=True)
 
     if coding == "delta":
         return torch.diff(X, dim=1, prepend=X[:, :1]).abs()
