@@ -212,21 +212,21 @@ def main(config):
     # ------------------------------------------
     # Windowing
     # ------------------------------------------
-    dXf_w_train, y_w_train = create_sequences(dXf_t_train, y_t_train,
-                                      sequence_length=config["WINDOW"],
-                                      stride=config["STRIDE"])
-    dXf_w_val, y_w_val = create_sequences(dXf_t_val, y_t_val,
-                                    sequence_length=config["WINDOW"],
-                                    stride=config["STRIDE"])
-    dXf_w_test, y_w_test = create_sequences(dXf_t_test, y_t_test,
-                                     sequence_length=config["WINDOW"],
-                                     stride=config["STRIDE"])
+    dXf_w_train, y_w_train = create_sequences(dXf_t_train, y_train_snn,
+                                              sequence_length=config["WINDOW"],
+                                              stride=config["STRIDE"])
+    dXf_w_val, y_w_val = create_sequences(dXf_t_val, y_val_snn,
+                                          sequence_length=config["WINDOW"],
+                                          stride=config["STRIDE"])
+    dXf_w_test, y_w_test = create_sequences(dXf_t_test, y_test_snn,
+                                            sequence_length=config["WINDOW"],
+                                            stride=1)
 
     # ------------------------------------------
     # Balance
     # ------------------------------------------
     if config["BALANCE_DATA"]:
-        dXf_w_train_norm, y_w_train = balance_sequences(dXf_w_train, y_w_train)
+        dXf_w_train, y_w_train = balance_sequences(dXf_w_train, y_w_train)
     print(f"Training sequences: {len(dXf_w_train):,}; test sequences: {len(dXf_w_test):,} ; "
           f"validation sequences: {len(dXf_w_val):,}")
 
@@ -237,7 +237,7 @@ def main(config):
     # Init
     # ------------------------------------------
     # Model
-    mdlSNN = SNNModel(input_size=dXf_t_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+    mdlSNN = SNNModel(input_size=dXf_w_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
                       num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
 
     # Loss Fnc and Optimizer
@@ -248,12 +248,12 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        mdlSNN = train_snn(mdlSNN, dXf_t_train, y_train_snn, dXf_t_val, y_val_snn, opt, loss_fn, config, device)
+        mdlSNN = train_snn(mdlSNN, dXf_w_train, y_w_train, dXf_w_val, y_w_val, opt, loss_fn, config, device)
 
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = test_snn(mdlSNN, dXf_t_test, config, device, load_checkpoint=True)
+    evaluation = test_snn(mdlSNN, dXf_w_test, config, device, load_checkpoint=True)
     y_pred = evaluation["predictions"]
 
     # ===============================================================================
@@ -293,7 +293,7 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    accuracy = float((y_pred == y_test_snn.astype(int)).mean())
+    accuracy = float((y_pred == y_w_test.astype(int)).mean())
     print(f"Validation accuracy: {accuracy:.4f}")
 
     # ===============================================================================

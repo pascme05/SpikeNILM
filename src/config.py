@@ -14,7 +14,7 @@ def build_config_default():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": 20000,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -36,7 +36,7 @@ def build_config_default():
         "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
         "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
         "USE_DERIVATIVE": False,                                                 # True = predict state changes;  False = predict ON/OFF
-        "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
+        "BALANCE_DATA": False,                                                   # Undersample majority class for balanced training
         "DEVICE": "auto",                                                       # 'auto' = prefer CUDA, otherwise CPU; can also force 'cuda' or 'cpu'
         "GPU_INDEX": 0,                                                         # CUDA device index when DEVICE resolves to GPU
         "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
@@ -54,15 +54,15 @@ def build_config_default():
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "SNN_DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
         "SNN_CODING": "rate",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
-        "SNN_INPUT_TRANSFORM": "delta",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
+        "SNN_INPUT_TRANSFORM": "absolute",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
         "SNN_DELTA_MODE": "absolute",                                           # 'absolute' = magnitude of change, 'signed' = signed change
         "SNN_LOSS_MODE": "membrane",                                            # Loss target: 'membrane' | 'spike'
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "SNN_ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
         "SNN_OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
-        "SNN_BATCH_SIZE": 1024,                                                     # Mini-batch size for training
+        "SNN_BATCH_SIZE": 128,                                                     # Mini-batch size for training
         "SNN_LR": 1e-3,                                                             # Learning rate for Adam optimiser
-        "SNN_EPOCHS": 500,                                                           # Number of training epochs
+        "SNN_EPOCHS": 2,                                                           # Number of training epochs
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
