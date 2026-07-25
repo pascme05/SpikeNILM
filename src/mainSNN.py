@@ -157,12 +157,7 @@ def main(config):
     # ------------------------------------------
     # Delta Features
     # ------------------------------------------
-    if config.get("SNN_INPUT_TRANSFORM", "delta") == "delta":
-        dXf_t = feature_deltas(Xf_t, mode=config.get("SNN_DELTA_MODE", "absolute"))
-    elif config.get("SNN_INPUT_TRANSFORM") == "absolute":
-        dXf_t = Xf_t
-    else:
-        raise ValueError("SNN_INPUT_TRANSFORM must be 'delta' or 'absolute'.")
+    dXf_t = feature_deltas(Xf_t, mode=config.get("SNN_DELTA_MODE", "absolute"))
     dy_t = feature_deltas(y_t, mode="absolute")
     ds_t = feature_deltas(s_t, mode="absolute")
 
@@ -203,8 +198,24 @@ def main(config):
     ds_t_test = ds_t[split_idx_train:]
 
     # ------------------------------------------
+    # Input Selector
+    # ------------------------------------------
+    # SNN
+    if config.get("SNN_INPUT_TRANSFORM", "delta") == "delta":
+        X_snn_train = dXf_t_train
+        X_snn_test = dXf_t_test
+        X_snn_val = dXf_t_val
+    elif config.get("SNN_INPUT_TRANSFORM") == "absolute":
+        X_snn_train = Xf_t_train
+        X_snn_test = Xf_t_test
+        X_snn_val = Xf_t_val
+    else:
+        raise ValueError("SNN_INPUT_TRANSFORM must be 'delta' or 'absolute'.")
+
+    # ------------------------------------------
     # Creat Targets
     # ------------------------------------------
+    # SNN
     y_train_snn = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
     y_val_snn = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
     y_test_snn = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
@@ -212,23 +223,25 @@ def main(config):
     # ------------------------------------------
     # Windowing
     # ------------------------------------------
-    dXf_w_train, y_w_train = create_sequences(dXf_t_train, y_train_snn,
-                                              sequence_length=config["WINDOW"],
-                                              stride=config["STRIDE"])
-    dXf_w_val, y_w_val = create_sequences(dXf_t_val, y_val_snn,
-                                          sequence_length=config["WINDOW"],
-                                          stride=config["STRIDE"])
-    dXf_w_test, y_w_test = create_sequences(dXf_t_test, y_test_snn,
+    # SNN
+    X_snn_train, y_train_snn = create_sequences(X_snn_train, y_train_snn,
+                                                sequence_length=config["WINDOW"],
+                                                stride=config["STRIDE"])
+    X_snn_val, y_val_snn = create_sequences(X_snn_val, y_val_snn,
                                             sequence_length=config["WINDOW"],
-                                            stride=1)
+                                            stride=config["STRIDE"])
+    X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
+                                              sequence_length=config["WINDOW"],
+                                              stride=1)
+    time_sequence_pred = time_sequence_test[:len(y_test_snn)]
 
     # ------------------------------------------
     # Balance
     # ------------------------------------------
     if config["BALANCE_DATA"]:
-        dXf_w_train, y_w_train = balance_sequences(dXf_w_train, y_w_train)
-    print(f"Training sequences: {len(dXf_w_train):,}; test sequences: {len(dXf_w_test):,} ; "
-          f"validation sequences: {len(dXf_w_val):,}")
+        X_snn_train, y_train_snn = balance_sequences(X_snn_train, y_train_snn)
+    print(f"Training sequences: {len(X_snn_train):,}; test sequences: {len(X_snn_test):,} ; "
+          f"validation sequences: {len(X_snn_val):,}")
 
     # ===============================================================================
     # STAGE 3: SNN Classification
@@ -237,7 +250,7 @@ def main(config):
     # Init
     # ------------------------------------------
     # Model
-    mdlSNN = SNNModel(input_size=dXf_w_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+    mdlSNN = SNNModel(input_size=X_snn_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
                       num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
 
     # Loss Fnc and Optimizer
@@ -248,12 +261,12 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        mdlSNN = train_snn(mdlSNN, dXf_w_train, y_w_train, dXf_w_val, y_w_val, opt, loss_fn, config, device)
+        mdlSNN = train_snn(mdlSNN, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
 
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = test_snn(mdlSNN, dXf_w_test, config, device, load_checkpoint=True)
+    evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
     y_pred = evaluation["predictions"]
 
     # ===============================================================================
@@ -293,7 +306,7 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    accuracy = float((y_pred == y_w_test.astype(int)).mean())
+    accuracy = float((y_pred == y_test_snn.astype(int)).mean())
     print(f"Validation accuracy: {accuracy:.4f}")
 
     # ===============================================================================
@@ -359,22 +372,22 @@ def main(config):
         delta_axis.set_yticks(range(len(f_names)), f_names)
         fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
 
-        power_raw_test = np.repeat(y_t_test[:, 0], W)
-        state_raw_test = np.repeat(s_t_test[:, 0], W)
-        delta_state_raw_test = np.repeat(ds_t_test[:, 0], W)
-        power_axis.plot(time_raw_test, power_raw_test, color="tab:green", linewidth=0.5, rasterized=True, label="power")
+        # power_raw_test = np.repeat(y_t_test[:, 0], W)
+        # state_raw_test = np.repeat(s_t_test[:, 0], W)
+        # delta_state_raw_test = np.repeat(ds_t_test[:, 0], W)
+        power_axis.plot(time_sequence_test, y_t_test, color="tab:green", linewidth=0.5, rasterized=True, label="power")
         power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)", ylabel="Power (W)")
         power_axis.legend(loc="upper right")
 
-        state_axis.step(time_raw_test, state_raw_test, where="post", color="tab:blue", linewidth=0.5,
+        state_axis.step(time_sequence_test, s_t_test, where="post", color="tab:blue", linewidth=0.5,
                         rasterized=True, label="ON/OFF state")
-        state_axis.step(time_raw_test, delta_state_raw_test, where="post", color="tab:orange", linewidth=0.5,
+        state_axis.step(time_sequence_test, ds_t_test, where="post", color="tab:orange", linewidth=0.5,
                         rasterized=True, label="state change")
         state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)", ylabel="State",
                        ylim=(-0.1, 1.1))
         state_axis.legend(loc="upper right")
 
-        prediction_indices = np.arange(config["SNN_SEQ_LEN"] - 1, len(y_t_test), config["STRIDE"])
+        prediction_indices = np.arange(config["WINDOW"] - 1, len(y_t_test), 1)
         prediction_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
         probability_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
         prediction_sequence[prediction_indices] = y_pred[:, 0]
@@ -383,13 +396,13 @@ def main(config):
         valid_predictions = last_prediction_indices >= 0
         prediction_sequence[valid_predictions] = y_pred[last_prediction_indices[valid_predictions], 0]
         probability_sequence[valid_predictions] = evaluation["probabilities"][last_prediction_indices[valid_predictions], 0]
-        prediction_raw_test = np.repeat(prediction_sequence, W)
-        probability_raw_test = np.repeat(probability_sequence, W)
-        prediction_axis.step(time_raw_test, np.repeat(s_t_test[:, 0], W), where="post", color="tab:blue", linewidth=0.5,
+        # prediction_raw_test = np.repeat(prediction_sequence, W)
+        # probability_raw_test = np.repeat(probability_sequence, W)
+        prediction_axis.step(time_sequence_test, s_t_test, where="post", color="tab:blue", linewidth=0.5,
                              rasterized=True, label="target")
-        prediction_axis.step(time_raw_test, prediction_raw_test, where="post", color="tab:red", linewidth=0.5,
+        prediction_axis.step(time_sequence_test, prediction_sequence, where="post", color="tab:red", linewidth=0.5,
                              rasterized=True, label="prediction")
-        prediction_axis.plot(time_raw_test, probability_raw_test, color="tab:purple", linewidth=0.5, alpha=0.7,
+        prediction_axis.plot(time_sequence_test, probability_sequence, color="tab:purple", linewidth=0.5, alpha=0.7,
                              rasterized=True, label="membrane probability")
         prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
                             ylim=(-0.1, 1.1))
