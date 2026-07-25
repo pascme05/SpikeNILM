@@ -36,13 +36,13 @@ def build_config_default():
         "INPUT_NORM": "0-1",                                                    # Shared input normalisation: 'none' | '0-1' | 'mean/std'
         "OUTPUT_NORM": "none",                                                  # Regression target normalisation: 'none' | '0-1' | 'mean/std'
         "USE_DERIVATIVE": False,                                                 # True = predict state changes;  False = predict ON/OFF
-        "BALANCE_DATA": False,                                                   # Undersample majority class for balanced training
+        "BALANCE_DATA": True,                                                   # Undersample majority class for balanced training
         "DEVICE": "auto",                                                       # 'auto' = prefer CUDA, otherwise CPU; can also force 'cuda' or 'cpu'
         "GPU_INDEX": 0,                                                         # CUDA device index when DEVICE resolves to GPU
         "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
 
         # ── General Model Para  ──────────────────────────────────────────────
-        "WINDOW": 100,  # Number of AC cycles per input window
+        "WINDOW": 20,  # Number of AC cycles per input window
         "STRIDE": 1,  # Sliding-window stride used during training
 
 
@@ -54,15 +54,15 @@ def build_config_default():
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "SNN_DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
         "SNN_CODING": "rate",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
-        "SNN_INPUT_TRANSFORM": "delta",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
+        "SNN_INPUT_TRANSFORM": "absolute",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
         "SNN_DELTA_MODE": "absolute",                                           # 'absolute' = magnitude of change, 'signed' = signed change
         "SNN_LOSS_MODE": "membrane",                                            # Loss target: 'membrane' | 'spike'
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "SNN_ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
         "SNN_OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
-        "SNN_BATCH_SIZE": 1024,                                                     # Mini-batch size for training
+        "SNN_BATCH_SIZE": 256,                                                     # Mini-batch size for training
         "SNN_LR": 1e-3,                                                             # Learning rate for Adam optimiser
-        "SNN_EPOCHS": 5,                                                           # Number of training epochs
+        "SNN_EPOCHS": 500,                                                           # Number of training epochs
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "mdl/best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
@@ -74,14 +74,15 @@ def build_config_default():
         # ── Regression stage ──────────────────────────────────────────────────
         "REG_TYPE": "lstm",                                               # Regressor architecture: 'cnn' | 'lstm'
         "REG_USE_SNN_INPUT": True,                                              # True = features + SNN spikes;  False = features only
-        "REG_DO_TRAIN": True,                                             # True = train;  False = load from checkpoint
+        "REG_DO_TRAIN": False,                                             # True = train;  False = load from checkpoint
         "REG_EPOCHS": 100,                                                # Number of training epochs for the regressor
+        "REG_BATCH_SIZE": 256,                                                    # Mini-batch size for training the regressor
         "REG_LR": 1e-3,                                                   # Learning rate for the regressor
         "REG_HIDDEN_SIZE": 64,                                                  # Hidden layer width for the regressor
         "REG_NUM_LAYERS": 2,                                                    # Number of stacked layers for the regressor
         "REG_DROPOUT": 0.2,                                                     # Dropout probability for the regressor (LSTM only)
         "REG_KERNEL_SIZE": 5,                                                   # Convolutional kernel size for the regressor (CNN only)
-        "REG_SAVE_PATH": "mdl/best_regressor.pt",                             # Checkpoint path for the regressor
+        "REG_SAVE_PATH": "mdl/best_reg_dev{device_id}.pt",                             # Checkpoint path for the regressor
 
         # ── Plotting ──────────────────────────────────────────────────────────
         # Disable plots during automated runs (e.g. Optuna sweeps) to save time.

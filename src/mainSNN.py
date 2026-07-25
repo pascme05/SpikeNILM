@@ -25,6 +25,7 @@ Non-Intrusive Load Monitoring (NILM) pipeline for the REDD high-frequency datase
 # ===============================================================================
 from auxFnc import (
     SNNModel,
+    LSTMModel,
     balance_sequences,
     binarize_output,
     create_sequences,
@@ -35,6 +36,8 @@ from auxFnc import (
     load_data,
     test_snn,
     train_snn,
+    train_lstm,
+    test_lstm,
     check_hardware,
 )
 from config import build_config_default
@@ -143,6 +146,10 @@ def main(config):
     ymax = y_t[split_idx_val:split_idx_train].max(axis=0, keepdims=True)
     y_t = (y_t - ymin) / (ymax - ymin + 1e-8)
 
+    # Threshold
+    config["THRESHOLD"] = config["THRESHOLD"] / (ymax - ymin + 1e-8)
+    config["Scale"] = ymax - ymin + 1e-8
+
     # ===============================================================================
     # STAGE 2: Feature Extraction
     # ===============================================================================
@@ -212,6 +219,11 @@ def main(config):
     else:
         raise ValueError("SNN_INPUT_TRANSFORM must be 'delta' or 'absolute'.")
 
+    # REG
+    X_reg_train = Xf_t_train
+    X_reg_test = Xf_t_test
+    X_reg_val = Xf_t_val
+
     # ------------------------------------------
     # Creat Targets
     # ------------------------------------------
@@ -219,6 +231,11 @@ def main(config):
     y_train_snn = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
     y_val_snn = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
     y_test_snn = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
+
+    # REG
+    y_reg_train = y_t_train
+    y_reg_val = y_t_val
+    y_reg_test = y_t_test
 
     # ------------------------------------------
     # Windowing
@@ -244,14 +261,33 @@ def main(config):
                                                   stride=1,
                                                   mode=config["SNN_MODE"])
 
+    # REG
+    X_reg_train, y_reg_train = create_sequences(X_reg_train, y_reg_train,
+                                                sequence_length=config["WINDOW"],
+                                                stride=config["STRIDE"],
+                                                mode=config["SNN_MODE"])
+    X_reg_val, y_reg_val = create_sequences(X_reg_val, y_reg_val,
+                                            sequence_length=config["WINDOW"],
+                                            stride=config["STRIDE"],
+                                            mode=config["SNN_MODE"])
+    X_reg_test, y_reg_test = create_sequences(X_reg_test, y_reg_test,
+                                              sequence_length=config["WINDOW"],
+                                              stride=1,
+                                              mode=config["SNN_MODE"])
+
     # ------------------------------------------
     # Balance
     # ------------------------------------------
     if config["BALANCE_DATA"]:
-        X_snn_train, y_train_snn = balance_sequences(X_snn_train, y_train_snn)
+        num_pos = y_train_snn.sum()
+        num_neg = y_train_snn.size - num_pos
+        pos_weight = torch.tensor([num_neg / num_pos], device=device)
+    else:
+        pos_weight = torch.tensor([1 / 1], device=device)
     print(f"Training sequences: {len(X_snn_train):,}; test sequences: {len(X_snn_test):,} ; "
           f"validation sequences: {len(X_snn_val):,}")
 
+    """
     # ===============================================================================
     # STAGE 3: SNN Classification
     # ===============================================================================
@@ -264,15 +300,17 @@ def main(config):
 
     # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlSNN.parameters(), lr=config["SNN_LR"])
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
+        # X_snn_train = X_snn_train[:20, :, :]
+        # y_train_snn = y_train_snn[:20, :]
         mdlSNN = train_snn(mdlSNN, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
 
-    # ------------------------------------------
+    # -----------------------------------------
     # Inference
     # ------------------------------------------
     if config["SNN_MODE"] == "s2s":
@@ -285,6 +323,7 @@ def main(config):
         y_pred_snn = evaluation["predictions"]
         y_prob_snn = evaluation["probabilities"]
     time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
+    """
 
     # ===============================================================================
     # STAGE 4: LSTM Regression
@@ -292,14 +331,30 @@ def main(config):
     # ------------------------------------------
     # Init
     # ------------------------------------------
+    # Model
+    mdlREG = LSTMModel(input_size=X_snn_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
+                       num_layers=config["REG_NUM_LAYERS"]).to(device)
 
-    # ------------------------------------------
-    # Setup Data
-    # ------------------------------------------
+    # Loss Fnc and Optimizer
+    opt = torch.optim.Adam(mdlREG.parameters(), lr=config["REG_LR"])
+    # loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    loss_fn = nn.MSELoss(reduction="mean")
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
+    if config["REG_DO_TRAIN"]:
+        # X_snn_train = X_snn_train[:20, :, :]
+        # y_train_snn = y_train_snn[:20, :]
+        mdlREG = train_lstm(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device)
+
+    # ------------------------------------------
+    # Inference
+    # ------------------------------------------
+    evaluation = test_lstm(mdlREG, X_reg_test, config, device, load_checkpoint=True)
+    y_pred_snn = evaluation["predictions"]
+    y_prob_snn = evaluation["probabilities"]
+    time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
 
     # ===============================================================================
     # STAGE 5: Prediction and Accuracy
@@ -400,7 +455,6 @@ def main(config):
         state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)", ylabel="State",
                        ylim=(-0.1, 1.1))
         state_axis.legend(loc="upper right")
-
 
         prediction_axis.step(time_sequence_pred, y_test_snn, where="post", color="tab:blue", linewidth=0.5,
                              rasterized=True, label="target")

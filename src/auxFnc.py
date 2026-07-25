@@ -380,10 +380,11 @@ def get_logits(mem_rec, mode):
 
     raise ValueError("mode must be 's2p' or 's2s'")
 
+
 # ==============================================================================
 # SNN Model
 # ==============================================================================
-class SNNModel(nn.Module):
+class SNNModel2(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
         super().__init__()
         if num_layers < 1:
@@ -417,6 +418,37 @@ class SNNModel(nn.Module):
             spks.append(output_spikes)
             memories.append(output_memory)
         return torch.stack(spks, dim=1), torch.stack(memories, dim=1)
+
+
+class SNNModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1.")
+
+        self.hidden_layers = nn.ModuleList()
+        self.hidden_lifs = nn.ModuleList()
+        layer_input_size = input_size
+        for _ in range(num_layers):
+            self.hidden_layers.append(nn.Linear(layer_input_size, hidden_size))
+            self.hidden_lifs.append(snn.Leaky(beta=beta))
+            layer_input_size = hidden_size
+        self.output_layer = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        if x.ndim != 3:
+            raise ValueError("SNN input must have shape [batch, sequence, features].")
+
+        hidden_memories = [lif.init_leaky() for lif in self.hidden_lifs]
+        outputs = []
+        for t in range(x.shape[1]):
+            activations = x[:, t]
+            for index, (layer, lif) in enumerate(zip(self.hidden_layers, self.hidden_lifs)):
+                activations, hidden_memories[index] = lif(layer(activations), hidden_memories[index])
+            logits = self.output_layer(activations)
+            outputs.append(logits)
+
+        return torch.stack(outputs, dim=1)
 
 
 # ==============================================================================
@@ -490,9 +522,10 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
             xb = xb.to(device, non_blocking=device.type == "cuda")
             yb = yb.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad()
-            _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-            logits = get_logits(mem_rec, cfg["SNN_MODE"])
-            loss = loss_fnc(logits, yb)
+            # _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
+            # logits = get_logits(mem_rec, cfg["SNN_MODE"])
+            logits = mdl(encode(xb, cfg["SNN_CODING"]))
+            loss = loss_fnc(get_logits(logits, cfg["SNN_MODE"]), yb)
             loss.backward()
             opt.step()
             epoch_train_loss += loss.item() * xb.size(0)
@@ -504,9 +537,10 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
             for xb, yb in snn_val_loader:
                 xb = xb.to(device, non_blocking=device.type == "cuda")
                 yb = yb.to(device, non_blocking=device.type == "cuda")
-                _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-                logits = get_logits(mem_rec, cfg["SNN_MODE"])
-                epoch_val_loss += loss_fnc(logits, yb).item() * xb.size(0)
+                # _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
+                # logits = get_logits(mem_rec, cfg["SNN_MODE"])
+                logits = mdl(encode(xb, cfg["SNN_CODING"]))
+                epoch_val_loss += loss_fnc(get_logits(logits, cfg["SNN_MODE"]), yb).item() * xb.size(0)
 
         # Report loss
         epoch_train_loss /= max(len(snn_train_dataset), 1)
@@ -551,9 +585,6 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
 # FNC: SNN Testing Loop
 # ==============================================================================
 def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
-    # ------------------------------------------
-    # Description
-    # ------------------------------------------
 
     # ------------------------------------------
     # Load Checkpoint
@@ -561,40 +592,40 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
     if load_checkpoint:
         if not os.path.exists(cfg["SNN_SAVE_PATH"]):
             raise FileNotFoundError(f"Missing SNN checkpoint: {cfg['SNN_SAVE_PATH']}")
-        checkpoint = torch.load(cfg["SNN_SAVE_PATH"], map_location=device, weights_only=False)
+
+        checkpoint = torch.load(
+            cfg["SNN_SAVE_PATH"],
+            map_location=device,
+            weights_only=False,
+        )
         mdl.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded SNN checkpoint from {cfg['SNN_SAVE_PATH']}")
 
     # ------------------------------------------
-    # Eval
+    # Evaluation
     # ------------------------------------------
-    # Init
     mdl.eval()
 
-    # Calc
     with torch.no_grad():
-        X_test = torch.as_tensor(X_test, dtype=torch.float32, device=device)
-        spk_all, mem_all = mdl(encode(X_test, cfg["SNN_CODING"]))
-        logits_all = get_logits(mem_all, cfg["SNN_MODE"])
 
-        probabilities = torch.sigmoid(logits_all)
+        X_test = torch.as_tensor(
+            X_test,
+            dtype=torch.float32,
+            device=device,
+        )
 
-        if cfg.get("SNN_EVAL_MODE", "membrane") == "spike_count":
-            if cfg["SNN_MODE"] == "s2p":
-                predictions = (spk_all.mean(dim=1) >= 0.5).to(torch.int64)
-            else:
-                predictions = (spk_all >= 0.5).to(torch.int64)
-        elif cfg.get("SNN_EVAL_MODE") == "spike_any":
-            if cfg["SNN_MODE"] == "s2p":
-                predictions = (spk_all.any(dim=1)).to(torch.int64)
-            else:
-                predictions = spk_all.to(torch.int64)
-        else:
-            predictions = (probabilities >= 0.5).to(torch.int64)
+        logits = mdl(encode(X_test, cfg["SNN_CODING"]))
+
+        logits = get_logits(logits, cfg["SNN_MODE"])
+
+        probabilities = torch.sigmoid(logits)
+
+        predictions = (probabilities >= 0.5).to(torch.int64)
 
     return {
-        "predictions": predictions.cpu().numpy(),
+        "logits": logits.cpu().numpy(),
         "probabilities": probabilities.cpu().numpy(),
+        "predictions": predictions.cpu().numpy(),
     }
 
 
@@ -602,5 +633,199 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
 # Regression Functions
 #######################################################################################################################
 # ==============================================================================
+# FNC: LSTM Model
+# ==============================================================================
+class LSTMModel(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        hidden_size,
+        output_size,
+        num_layers=1,
+        dropout=0.2,
+        output_mode="s2p",
+    ):
+        super().__init__()
+
+        self.output_mode = output_mode.lower()
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.output_layer = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+
+        if x.ndim != 3:
+            raise ValueError(
+                "Input must have shape (batch, sequence, features)."
+            )
+
+        # outputs: (batch, seq, hidden)
+        outputs, _ = self.lstm(x)
+
+        # logits for every timestep
+        logits = self.output_layer(outputs)
+
+        if self.output_mode == "s2p":
+            return logits[:, -1, :]
+
+        elif self.output_mode == "s2s":
+            return logits
+
+        else:
+            raise ValueError("output_mode must be 's2p' or 's2s'.")
+
+
+# ==============================================================================
 # FNC: LSTM Training Loop
 # ==============================================================================
+def train_lstm(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
+    # ------------------------------------------
+    # Description
+    # ------------------------------------------
+
+    # ------------------------------------------
+    # Init
+    # ------------------------------------------
+    train_losses = []
+    val_losses = []
+    best_val_loss = float("inf")
+    best_state = None
+    no_improve = 0
+
+    # ------------------------------------------
+    # Data Prep
+    # ------------------------------------------
+    train_dataset = TensorDataset(
+        torch.as_tensor(X_train, dtype=torch.float32),
+        torch.as_tensor(y_train, dtype=torch.float32),
+    )
+    val_dataset = TensorDataset(
+        torch.as_tensor(X_val, dtype=torch.float32),
+        torch.as_tensor(y_val, dtype=torch.float32),
+    )
+    loader_kwargs = {
+        "batch_size": cfg["REG_BATCH_SIZE"],
+        "num_workers": cfg.get("NUM_WORKERS", 0),
+        "pin_memory": device.type == "cuda",
+    }
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+
+    # ------------------------------------------
+    # Train
+    # ------------------------------------------
+    for epoch in range(cfg["REG_EPOCHS"]):
+        # Init
+        mdl.train()
+        epoch_train_loss = 0.0
+
+        # Loop over Batches
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=device.type == "cuda")
+            yb = yb.to(device, non_blocking=device.type == "cuda")
+            opt.zero_grad()
+            y_hat = mdl(xb)
+            loss = loss_fnc(y_hat, yb)
+            loss.backward()
+            opt.step()
+            epoch_train_loss += loss.item() * xb.size(0)
+
+        # Eval Validation data
+        mdl.eval()
+        epoch_val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device, non_blocking=device.type == "cuda")
+                yb = yb.to(device, non_blocking=device.type == "cuda")
+                y_hat = mdl(xb)
+                epoch_val_loss += loss_fnc(y_hat, yb).item() * xb.size(0)
+
+        # Report loss
+        epoch_train_loss /= max(len(train_dataset), 1)
+        epoch_val_loss /= max(len(val_dataset), 1)
+        train_losses.append(epoch_train_loss)
+        val_losses.append(epoch_val_loss)
+        print(f"REG {epoch + 1}/{cfg['REG_EPOCHS']} | Train: {epoch_train_loss:.4f} | Val: {epoch_val_loss:.4f}")
+
+        # Early Stopping
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            best_state = copy.deepcopy(mdl.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= cfg.get("REG_PATIENCE", cfg["REG_EPOCHS"]):
+                print(f"REG early stopping at epoch {epoch + 1}")
+                break
+
+    # ------------------------------------------
+    # Finalize
+    # ------------------------------------------
+    # Best State
+    if best_state is not None:
+        mdl.load_state_dict(best_state)
+
+    # Saving
+    torch.save(
+        {
+            "model_state_dict": mdl.state_dict(),
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+        },
+        cfg["REG_SAVE_PATH"],
+    )
+    print(f"Saved REG checkpoint to {cfg['REG_SAVE_PATH']}")
+
+    return mdl
+
+
+# ==============================================================================
+# FNC: SNN Testing Loop
+# ==============================================================================
+def test_lstm(mdl, X_test, cfg, device, load_checkpoint=True):
+    # ------------------------------------------
+    # Load Checkpoint
+    # ------------------------------------------
+    if load_checkpoint:
+        if not os.path.exists(cfg["REG_SAVE_PATH"]):
+            raise FileNotFoundError(f"Missing REG checkpoint: {cfg['REG_SAVE_PATH']}")
+
+        checkpoint = torch.load(
+            cfg["REG_SAVE_PATH"],
+            map_location=device,
+            weights_only=False,
+        )
+        mdl.load_state_dict(checkpoint["model_state_dict"])
+        print(f"Loaded REG checkpoint from {cfg['REG_SAVE_PATH']}")
+
+    # ------------------------------------------
+    # Evaluation
+    # ------------------------------------------
+    mdl.eval()
+
+    with torch.no_grad():
+
+        X_test = torch.as_tensor(
+            X_test,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        y_hat = mdl(X_test)
+
+        threshold = float(np.asarray(cfg["THRESHOLD"]).squeeze())
+        probabilities = torch.sigmoid(y_hat)
+        predictions = (y_hat >= threshold).to(torch.int64)
+
+    return {
+        "logits": y_hat.cpu().numpy(),
+        "probabilities": probabilities.cpu().numpy(),
+        "predictions": predictions.cpu().numpy(),
+    }
