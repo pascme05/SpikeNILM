@@ -226,14 +226,23 @@ def main(config):
     # SNN
     X_snn_train, y_train_snn = create_sequences(X_snn_train, y_train_snn,
                                                 sequence_length=config["WINDOW"],
-                                                stride=config["STRIDE"])
+                                                stride=config["STRIDE"],
+                                                mode=config["SNN_MODE"])
     X_snn_val, y_val_snn = create_sequences(X_snn_val, y_val_snn,
                                             sequence_length=config["WINDOW"],
-                                            stride=config["STRIDE"])
-    X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
-                                              sequence_length=config["WINDOW"],
-                                              stride=1)
-    time_sequence_pred = time_sequence_test[:len(y_test_snn)]
+                                            stride=config["STRIDE"],
+                                            mode=config["SNN_MODE"])
+
+    if config["SNN_MODE"] == "s2s":
+        X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
+                                                  sequence_length=config["WINDOW"],
+                                                  stride=config["WINDOW"],
+                                                  mode=config["SNN_MODE"])
+    else:
+        X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
+                                                  sequence_length=config["WINDOW"],
+                                                  stride=1,
+                                                  mode=config["SNN_MODE"])
 
     # ------------------------------------------
     # Balance
@@ -266,8 +275,16 @@ def main(config):
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
-    y_pred = evaluation["predictions"]
+    if config["SNN_MODE"] == "s2s":
+        evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
+        y_pred_snn = evaluation["predictions"].reshape(-1, evaluation["predictions"].shape[-1])
+        y_test_snn = y_test_snn.reshape(-1, y_test_snn.shape[-1])
+        y_prob_snn = evaluation["probabilities"].reshape(-1, evaluation["probabilities"].shape[-1])
+    else:
+        evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
+        y_pred_snn = evaluation["predictions"]
+        y_prob_snn = evaluation["probabilities"]
+    time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
 
     # ===============================================================================
     # STAGE 4: LSTM Regression
@@ -306,7 +323,7 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    accuracy = float((y_pred == y_test_snn.astype(int)).mean())
+    accuracy = float((y_pred_snn == y_test_snn.astype(int)).mean())
     print(f"Validation accuracy: {accuracy:.4f}")
 
     # ===============================================================================
@@ -372,9 +389,6 @@ def main(config):
         delta_axis.set_yticks(range(len(f_names)), f_names)
         fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
 
-        # power_raw_test = np.repeat(y_t_test[:, 0], W)
-        # state_raw_test = np.repeat(s_t_test[:, 0], W)
-        # delta_state_raw_test = np.repeat(ds_t_test[:, 0], W)
         power_axis.plot(time_sequence_test, y_t_test, color="tab:green", linewidth=0.5, rasterized=True, label="power")
         power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)", ylabel="Power (W)")
         power_axis.legend(loc="upper right")
@@ -387,22 +401,12 @@ def main(config):
                        ylim=(-0.1, 1.1))
         state_axis.legend(loc="upper right")
 
-        prediction_indices = np.arange(config["WINDOW"] - 1, len(y_t_test), 1)
-        prediction_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
-        probability_sequence = np.full(len(y_t_test), np.nan, dtype=np.float32)
-        prediction_sequence[prediction_indices] = y_pred[:, 0]
-        probability_sequence[prediction_indices] = evaluation["probabilities"][:, 0]
-        last_prediction_indices = np.searchsorted(prediction_indices, np.arange(len(y_t_test)), side="right") - 1
-        valid_predictions = last_prediction_indices >= 0
-        prediction_sequence[valid_predictions] = y_pred[last_prediction_indices[valid_predictions], 0]
-        probability_sequence[valid_predictions] = evaluation["probabilities"][last_prediction_indices[valid_predictions], 0]
-        # prediction_raw_test = np.repeat(prediction_sequence, W)
-        # probability_raw_test = np.repeat(probability_sequence, W)
-        prediction_axis.step(time_sequence_test, s_t_test, where="post", color="tab:blue", linewidth=0.5,
+
+        prediction_axis.step(time_sequence_pred, y_test_snn, where="post", color="tab:blue", linewidth=0.5,
                              rasterized=True, label="target")
-        prediction_axis.step(time_sequence_test, prediction_sequence, where="post", color="tab:red", linewidth=0.5,
+        prediction_axis.step(time_sequence_pred, y_pred_snn, where="post", color="tab:red", linewidth=0.5,
                              rasterized=True, label="prediction")
-        prediction_axis.plot(time_sequence_test, probability_sequence, color="tab:purple", linewidth=0.5, alpha=0.7,
+        prediction_axis.plot(time_sequence_pred, y_prob_snn, color="tab:purple", linewidth=0.5, alpha=0.7,
                              rasterized=True, label="membrane probability")
         prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
                             ylim=(-0.1, 1.1))

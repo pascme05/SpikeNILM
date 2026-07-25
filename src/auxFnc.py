@@ -293,30 +293,93 @@ def feature_deltas(X, mode="absolute"):
     return deltas.astype(np.float32, copy=False)
 
 
-def create_sequences(features, targets, sequence_length, stride=1):
-    """Create sliding feature windows and align each one to its final target."""
+def create_sequences(features, targets, sequence_length, stride=1, mode="s2p"):
+    """
+    Create sliding windows for sequence-to-point or sequence-to-sequence learning.
+
+    Parameters
+    ----------
+    features : ndarray, shape (N, F)
+        Input features.
+    targets : ndarray, shape (N, C)
+        Target values.
+    sequence_length : int
+        Length of each input sequence.
+    stride : int
+        Window stride.
+    mode : {"s2p", "s2s"}
+        s2p -> target is the final sample of each window.
+        s2s -> target is the complete target sequence.
+
+    Returns
+    -------
+    X : ndarray
+        Shape (num_windows, sequence_length, F)
+    y : ndarray
+        s2p: (num_windows, C)
+        s2s: (num_windows, sequence_length, C)
+    """
+
     features = np.asarray(features, dtype=np.float32)
     targets = np.asarray(targets, dtype=np.float32)
+
     if features.ndim != 2:
-        raise ValueError("features must have shape [n_samples, n_features].")
+        raise ValueError("features must have shape (N, F).")
+
+    if targets.ndim != 2:
+        raise ValueError("targets must have shape (N, C).")
+
     if len(features) != len(targets):
         raise ValueError("features and targets must contain the same number of samples.")
+
     if sequence_length < 1 or sequence_length > len(features):
-        raise ValueError("sequence_length must be between 1 and the number of samples.")
+        raise ValueError("Invalid sequence_length.")
+
     if stride < 1:
         raise ValueError("stride must be at least 1.")
 
-    windows = np.lib.stride_tricks.sliding_window_view(
-        features, window_shape=sequence_length, axis=0
+    # Input windows
+    X = np.lib.stride_tricks.sliding_window_view(
+        features,
+        window_shape=sequence_length,
+        axis=0,
     )
-    windows = np.moveaxis(windows, -1, 1)[::stride].copy()
-    aligned_targets = targets[sequence_length - 1::stride].copy()
-    return windows, aligned_targets
+    X = np.moveaxis(X, -1, 1)[::stride].copy()
+
+    if mode.lower() == "s2p":
+        y = targets[sequence_length - 1::stride].copy()
+
+    elif mode.lower() == "s2s":
+        y = np.lib.stride_tricks.sliding_window_view(
+            targets,
+            window_shape=sequence_length,
+            axis=0,
+        )
+        y = np.moveaxis(y, -1, 1)[::stride].copy()
+
+    else:
+        raise ValueError("mode must be 's2p' or 's2s'.")
+
+    return X, y
 
 
 #######################################################################################################################
 # SNN Functions
 #######################################################################################################################
+# ==============================================================================
+# SNN s2s and s2p
+# ==============================================================================
+def get_logits(mem_rec, mode):
+    mode = mode.lower()
+
+    if mode == "s2p":
+        return mem_rec.mean(dim=1)
+
+    if mode == "s2s":
+        return mem_rec
+
+    raise ValueError("mode must be 's2p' or 's2s'")
+
 # ==============================================================================
 # SNN Model
 # ==============================================================================
@@ -428,7 +491,7 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
             yb = yb.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad()
             _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-            logits = mem_rec.mean(dim=1)
+            logits = get_logits(mem_rec, cfg["SNN_MODE"])
             loss = loss_fnc(logits, yb)
             loss.backward()
             opt.step()
@@ -442,7 +505,7 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
                 xb = xb.to(device, non_blocking=device.type == "cuda")
                 yb = yb.to(device, non_blocking=device.type == "cuda")
                 _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-                logits = mem_rec.mean(dim=1)
+                logits = get_logits(mem_rec, cfg["SNN_MODE"])
                 epoch_val_loss += loss_fnc(logits, yb).item() * xb.size(0)
 
         # Report loss
@@ -512,12 +575,20 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
     with torch.no_grad():
         X_test = torch.as_tensor(X_test, dtype=torch.float32, device=device)
         spk_all, mem_all = mdl(encode(X_test, cfg["SNN_CODING"]))
-        logits_all = mem_all.mean(dim=1)
+        logits_all = get_logits(mem_all, cfg["SNN_MODE"])
+
         probabilities = torch.sigmoid(logits_all)
+
         if cfg.get("SNN_EVAL_MODE", "membrane") == "spike_count":
-            predictions = (spk_all.mean(dim=1) >= 0.5).to(torch.int64)
+            if cfg["SNN_MODE"] == "s2p":
+                predictions = (spk_all.mean(dim=1) >= 0.5).to(torch.int64)
+            else:
+                predictions = (spk_all >= 0.5).to(torch.int64)
         elif cfg.get("SNN_EVAL_MODE") == "spike_any":
-            predictions = (spk_all.any(dim=1)).to(torch.int64)
+            if cfg["SNN_MODE"] == "s2p":
+                predictions = (spk_all.any(dim=1)).to(torch.int64)
+            else:
+                predictions = spk_all.to(torch.int64)
         else:
             predictions = (probabilities >= 0.5).to(torch.int64)
 

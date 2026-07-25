@@ -14,7 +14,7 @@ def build_config_default():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": 10000,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -47,9 +47,9 @@ def build_config_default():
 
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
-        "SNN_MODEL_TYPE": "snn",                                                    # Classifier type: 'snn' | 'cnn' | 'lstm'
-        "SNN_HIDDEN_SIZE": 64,                                                      # Hidden layer width (neurons / channels)
-        "SNN_NUM_LAYERS": 3,                                                        # Number of stacked layers
+        "SNN_MODE": "s2p",                                                    # Classifier type: 's2s' sequence to sequence | 's2p' = sequence to point
+        "SNN_HIDDEN_SIZE": 32,                                                      # Hidden layer width (neurons / channels)
+        "SNN_NUM_LAYERS": 2,                                                        # Number of stacked layers
         "SNN_BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "SNN_DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
