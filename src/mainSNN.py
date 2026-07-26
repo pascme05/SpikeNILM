@@ -287,7 +287,6 @@ def main(config):
     print(f"Training sequences: {len(X_snn_train):,}; test sequences: {len(X_snn_test):,} ; "
           f"validation sequences: {len(X_snn_val):,}")
 
-    """
     # ===============================================================================
     # STAGE 3: SNN Classification
     # ===============================================================================
@@ -306,8 +305,6 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        # X_snn_train = X_snn_train[:20, :, :]
-        # y_train_snn = y_train_snn[:20, :]
         mdlSNN = train_snn(mdlSNN, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
 
     # -----------------------------------------
@@ -323,8 +320,8 @@ def main(config):
         y_pred_snn = evaluation["predictions"]
         y_prob_snn = evaluation["probabilities"]
     time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
-    """
 
+    """
     # ===============================================================================
     # STAGE 4: LSTM Regression
     # ===============================================================================
@@ -332,20 +329,17 @@ def main(config):
     # Init
     # ------------------------------------------
     # Model
-    mdlREG = LSTMModel(input_size=X_snn_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
+    mdlREG = LSTMModel(input_size=X_reg_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
                        num_layers=config["REG_NUM_LAYERS"]).to(device)
 
     # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlREG.parameters(), lr=config["REG_LR"])
-    # loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     loss_fn = nn.MSELoss(reduction="mean")
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
     if config["REG_DO_TRAIN"]:
-        # X_snn_train = X_snn_train[:20, :, :]
-        # y_train_snn = y_train_snn[:20, :]
         mdlREG = train_lstm(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device)
 
     # ------------------------------------------
@@ -355,6 +349,7 @@ def main(config):
     y_pred_snn = evaluation["predictions"]
     y_prob_snn = evaluation["probabilities"]
     time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
+    """
 
     # ===============================================================================
     # STAGE 5: Prediction and Accuracy

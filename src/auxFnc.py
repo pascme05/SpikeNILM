@@ -38,6 +38,7 @@ import copy
 
 try:
     from snntorch import spikegen
+    from snntorch import surrogate
 except ImportError:
     spikegen = None
 
@@ -384,42 +385,6 @@ def get_logits(mem_rec, mode):
 # ==============================================================================
 # SNN Model
 # ==============================================================================
-class SNNModel2(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError("num_layers must be at least 1.")
-
-        self.hidden_layers = nn.ModuleList()
-        self.hidden_lifs = nn.ModuleList()
-        layer_input_size = input_size
-        for _ in range(num_layers):
-            self.hidden_layers.append(nn.Linear(layer_input_size, hidden_size))
-            self.hidden_lifs.append(snn.Leaky(beta=beta))
-            layer_input_size = hidden_size
-        self.output_layer = nn.Linear(hidden_size, output_size)
-        self.output_lif = snn.Leaky(beta=beta)
-
-    def forward(self, x):
-        if x.ndim != 3:
-            raise ValueError("SNN input must have shape [batch, sequence, features].")
-
-        hidden_memories = [lif.init_leaky() for lif in self.hidden_lifs]
-        output_memory = self.output_lif.init_leaky()
-        spks = []
-        memories = []
-        for t in range(x.shape[1]):
-            activations = x[:, t]
-            for index, (layer, lif) in enumerate(zip(self.hidden_layers, self.hidden_lifs)):
-                activations, hidden_memories[index] = lif(layer(activations), hidden_memories[index])
-            output_spikes, output_memory = self.output_lif(
-                self.output_layer(activations), output_memory
-            )
-            spks.append(output_spikes)
-            memories.append(output_memory)
-        return torch.stack(spks, dim=1), torch.stack(memories, dim=1)
-
-
 class SNNModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
         super().__init__()
@@ -431,7 +396,7 @@ class SNNModel(nn.Module):
         layer_input_size = input_size
         for _ in range(num_layers):
             self.hidden_layers.append(nn.Linear(layer_input_size, hidden_size))
-            self.hidden_lifs.append(snn.Leaky(beta=beta))
+            self.hidden_lifs.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid()))
             layer_input_size = hidden_size
         self.output_layer = nn.Linear(hidden_size, output_size)
 
@@ -445,6 +410,7 @@ class SNNModel(nn.Module):
             activations = x[:, t]
             for index, (layer, lif) in enumerate(zip(self.hidden_layers, self.hidden_lifs)):
                 activations, hidden_memories[index] = lif(layer(activations), hidden_memories[index])
+                activations = hidden_memories[index]
             logits = self.output_layer(activations)
             outputs.append(logits)
 

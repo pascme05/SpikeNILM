@@ -14,7 +14,7 @@ def build_config_default():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": 50000,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -42,7 +42,7 @@ def build_config_default():
         "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
 
         # ── General Model Para  ──────────────────────────────────────────────
-        "WINDOW": 20,  # Number of AC cycles per input window
+        "WINDOW": 60,  # Number of AC cycles per input window
         "STRIDE": 1,  # Sliding-window stride used during training
 
 
@@ -53,16 +53,17 @@ def build_config_default():
         "SNN_BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
         "SNN_DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
-        "SNN_CODING": "rate",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
+        "SNN_CODING": "raw",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
         "SNN_INPUT_TRANSFORM": "absolute",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
         "SNN_DELTA_MODE": "absolute",                                           # 'absolute' = magnitude of change, 'signed' = signed change
         "SNN_LOSS_MODE": "membrane",                                            # Loss target: 'membrane' | 'spike'
         "SNN_EVAL_MODE": "spike_count",                                         # Prediction strategy: 'spike_count'|'membrane'|'spike_any'
         "SNN_ON_RATE": 0.8,                                                         # Target spike rate for ON class   (spike loss mode)
         "SNN_OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
-        "SNN_BATCH_SIZE": 256,                                                     # Mini-batch size for training
+        "SNN_BATCH_SIZE": 1024,                                                     # Mini-batch size for training
         "SNN_LR": 1e-3,                                                             # Learning rate for Adam optimiser
-        "SNN_EPOCHS": 500,                                                           # Number of training epochs
+        "SNN_EPOCHS": 50,                                                           # Number of training epochs
+        "SNN_PATIENCE": 5,                                                          # Number of training epochs without improvement
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "mdl/best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
