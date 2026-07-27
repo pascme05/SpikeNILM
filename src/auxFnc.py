@@ -91,8 +91,12 @@ def load_data(mat_file, device_ids, maxLen=-1):
         Y_all = Y_all[:maxLen]
 
     X = X[:, 2:277, :]
+
     # Stack selected device columns into a 2D array [n_samples, n_devices]
-    Y = np.stack([Y_all[:, 1 + dev_id] for dev_id in device_ids], axis=1)
+    if device_ids[0] == 999:
+        Y = Y_all[:, 1:1 + Y_all.shape[1]]
+    else:
+        Y = np.stack([Y_all[:, 1 + dev_id] for dev_id in device_ids], axis=1)
     return X, Y
 
 
@@ -386,36 +390,108 @@ def get_logits(mem_rec, mode):
 # SNN Model
 # ==============================================================================
 class SNNModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1, beta=0.95):
+    def __init__(
+        self,
+        input_size,
+        hidden_size,
+        output_size,
+        num_layers=2,
+        beta=0.95,
+        dropout=0.2,
+    ):
         super().__init__()
+
         if num_layers < 1:
             raise ValueError("num_layers must be at least 1.")
 
         self.hidden_layers = nn.ModuleList()
         self.hidden_lifs = nn.ModuleList()
-        layer_input_size = input_size
+        self.dropouts = nn.ModuleList()
+
+        in_features = input_size
+
         for _ in range(num_layers):
-            self.hidden_layers.append(nn.Linear(layer_input_size, hidden_size))
-            self.hidden_lifs.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid()))
-            layer_input_size = hidden_size
-        self.output_layer = nn.Linear(hidden_size, output_size)
+
+            self.hidden_layers.append(
+                nn.Sequential(
+                    nn.Linear(in_features, hidden_size),
+                    nn.LayerNorm(hidden_size),
+                )
+            )
+
+            self.hidden_lifs.append(
+                snn.Leaky(
+                    beta=beta,
+                    spike_grad=surrogate.fast_sigmoid(),
+                )
+            )
+
+            self.dropouts.append(
+                nn.Dropout(dropout)
+            )
+
+            in_features = hidden_size
+
+        # Residual classifier
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_size + input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, output_size),
+        )
 
     def forward(self, x):
-        if x.ndim != 3:
-            raise ValueError("SNN input must have shape [batch, sequence, features].")
 
-        hidden_memories = [lif.init_leaky() for lif in self.hidden_lifs]
+        if x.ndim != 3:
+            raise ValueError(
+                "Input must be [batch, sequence, features]"
+            )
+
+        hidden_memories = [
+            lif.init_leaky()
+            for lif in self.hidden_lifs
+        ]
+
         outputs = []
-        for t in range(x.shape[1]):
-            activations = x[:, t]
-            for index, (layer, lif) in enumerate(zip(self.hidden_layers, self.hidden_lifs)):
-                activations, hidden_memories[index] = lif(layer(activations), hidden_memories[index])
-                activations = hidden_memories[index]
-            logits = self.output_layer(activations)
+
+        T = x.shape[1]
+
+        for t in range(T):
+
+            # Current FFT
+            current_input = x[:, t]
+
+            activations = current_input
+
+            for i, (layer, lif, dropout) in enumerate(
+                zip(
+                    self.hidden_layers,
+                    self.hidden_lifs,
+                    self.dropouts,
+                )
+            ):
+
+                current = layer(activations)
+
+                spikes, hidden_memories[i] = lif(
+                    current,
+                    hidden_memories[i],
+                )
+
+                # Use membrane potential
+                activations = dropout(hidden_memories[i])
+
+            # Residual connection
+            classifier_input = torch.cat(
+                [activations, current_input],
+                dim=1,
+            )
+
+            logits = self.output_layer(classifier_input)
+
             outputs.append(logits)
 
         return torch.stack(outputs, dim=1)
-
 
 # ==============================================================================
 # Spike Encoding
@@ -443,9 +519,6 @@ def encode(X, coding):
 # FNC: SNN Training Loop
 # ==============================================================================
 def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
-    # ------------------------------------------
-    # Description
-    # ------------------------------------------
 
     # ------------------------------------------
     # Init
@@ -457,7 +530,7 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
     no_improve = 0
 
     # ------------------------------------------
-    # Data Prep
+    # Data
     # ------------------------------------------
     snn_train_dataset = TensorDataset(
         torch.as_tensor(X_train, dtype=torch.float32),
@@ -472,77 +545,110 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
         "num_workers": cfg.get("NUM_WORKERS", 0),
         "pin_memory": device.type == "cuda",
     }
+
     snn_train_loader = DataLoader(snn_train_dataset, shuffle=True, **loader_kwargs)
-    snn_val_loader = DataLoader(snn_val_dataset, shuffle=False, **loader_kwargs)
+    snn_val_loader = DataLoader(snn_val_dataset, shuffle=False, **loader_kwargs,)
 
     # ------------------------------------------
-    # Train
+    # Learning Rate Scheduler
+    # ------------------------------------------
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=cfg.get("SNN_LR_FACTOR", 0.5),
+                                                           patience=cfg.get("SNN_LR_PATIENCE", 5),
+                                                           min_lr=cfg.get("SNN_MIN_LR", 1e-6))
+
+    # ------------------------------------------
+    # Training Loop
     # ------------------------------------------
     for epoch in range(cfg["SNN_EPOCHS"]):
-        # Init
+        # --------------------------
+        # Training
+        # --------------------------
         mdl.train()
         epoch_train_loss = 0.0
 
-        # Loop over Batches
         for xb, yb in snn_train_loader:
             xb = xb.to(device, non_blocking=device.type == "cuda")
             yb = yb.to(device, non_blocking=device.type == "cuda")
             opt.zero_grad()
-            # _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-            # logits = get_logits(mem_rec, cfg["SNN_MODE"])
             logits = mdl(encode(xb, cfg["SNN_CODING"]))
             loss = loss_fnc(get_logits(logits, cfg["SNN_MODE"]), yb)
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(mdl.parameters(), max_norm=cfg.get("SNN_GRAD_CLIP", 1.0))
             opt.step()
             epoch_train_loss += loss.item() * xb.size(0)
 
-        # Eval Validation data
+        # --------------------------
+        # Validation
+        # --------------------------
         mdl.eval()
         epoch_val_loss = 0.0
+
         with torch.no_grad():
             for xb, yb in snn_val_loader:
                 xb = xb.to(device, non_blocking=device.type == "cuda")
                 yb = yb.to(device, non_blocking=device.type == "cuda")
-                # _, mem_rec = mdl(encode(xb, cfg["SNN_CODING"]))
-                # logits = get_logits(mem_rec, cfg["SNN_MODE"])
                 logits = mdl(encode(xb, cfg["SNN_CODING"]))
-                epoch_val_loss += loss_fnc(get_logits(logits, cfg["SNN_MODE"]), yb).item() * xb.size(0)
+                loss = loss_fnc(get_logits(logits, cfg["SNN_MODE"]), yb)
+                epoch_val_loss += loss.item() * xb.size(0)
 
-        # Report loss
+        # --------------------------
+        # Average losses
+        # --------------------------
         epoch_train_loss /= max(len(snn_train_dataset), 1)
         epoch_val_loss /= max(len(snn_val_dataset), 1)
         train_losses.append(epoch_train_loss)
         val_losses.append(epoch_val_loss)
-        print(f"SNN {epoch + 1}/{cfg['SNN_EPOCHS']} | Train: {epoch_train_loss:.4f} | Val: {epoch_val_loss:.4f}")
 
-        # Early Stopping
+        # --------------------------
+        # Update learning rate
+        # --------------------------
+        scheduler.step(epoch_val_loss)
+        current_lr = opt.param_groups[0]["lr"]
+
+        print(
+            f"SNN {epoch+1:3d}/{cfg['SNN_EPOCHS']} | "
+            f"Train: {epoch_train_loss:.5f} | "
+            f"Val: {epoch_val_loss:.5f} | "
+            f"LR: {current_lr:.2e}"
+        )
+
+        # --------------------------
+        # Save best model
+        # --------------------------
         if epoch_val_loss < best_val_loss:
             best_val_loss = epoch_val_loss
             best_state = copy.deepcopy(mdl.state_dict())
             no_improve = 0
+
         else:
             no_improve += 1
             if no_improve >= cfg.get("SNN_PATIENCE", cfg["SNN_EPOCHS"]):
-                print(f"SNN early stopping at epoch {epoch + 1}")
+                print(f"\nEarly stopping at epoch {epoch+1}")
                 break
 
     # ------------------------------------------
-    # Finalize
+    # Restore Best Model
     # ------------------------------------------
-    # Best State
     if best_state is not None:
         mdl.load_state_dict(best_state)
 
-    # Saving
+    # ------------------------------------------
+    # Save Checkpoint
+    # ------------------------------------------
     torch.save(
         {
             "model_state_dict": mdl.state_dict(),
+            "best_val_loss": best_val_loss,
             "train_losses": train_losses,
             "val_losses": val_losses,
+            "learning_rate": opt.param_groups[0]["lr"],
         },
         cfg["SNN_SAVE_PATH"],
     )
-    print(f"Saved SNN checkpoint to {cfg['SNN_SAVE_PATH']}")
+
+    print(f"\nSaved SNN checkpoint to {cfg['SNN_SAVE_PATH']}")
 
     return mdl
 

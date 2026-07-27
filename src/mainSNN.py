@@ -373,8 +373,11 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    accuracy = float((y_pred_snn == y_test_snn.astype(int)).mean())
-    print(f"Validation accuracy: {accuracy:.4f}")
+    ACC_Device = (y_pred_snn == y_test_snn.astype(int)).mean(axis=0)
+    ACC_Total = float((y_pred_snn == y_test_snn.astype(int)).mean())
+    print(f"Testing accuracy total: {ACC_Total:.4f}")
+    for i, acc in enumerate(ACC_Device):
+        print(f"Device {i + 1}: {acc:.4f}")
 
     # ===============================================================================
     # STAGE 6: Plotting
@@ -383,86 +386,87 @@ def main(config):
     # SNN
     # ------------------------------------------
     if config["PLOT_SNN"]:
-        output_dir = project_root / "results"
-        output_dir.mkdir(exist_ok=True)
+        for i in range(0, C):
+            output_dir = project_root / "results"
+            output_dir.mkdir(exist_ok=True)
 
-        feature_magnitudes = np.abs(Xf_t_test)
-        encoding_magnitudes = np.abs(dXf_t_test)
-        positive_magnitudes = np.concatenate((feature_magnitudes.ravel(), encoding_magnitudes.ravel()))
-        positive_magnitudes = positive_magnitudes[positive_magnitudes > 0]
-        color_min = positive_magnitudes.min()
-        color_max = max(positive_magnitudes.max(), color_min * 10)
-        feature_norm = LogNorm(vmin=color_min, vmax=color_max)
-        feature_cmap = "viridis"
+            feature_magnitudes = np.abs(Xf_t_test)
+            encoding_magnitudes = np.abs(dXf_t_test)
+            positive_magnitudes = np.concatenate((feature_magnitudes.ravel(), encoding_magnitudes.ravel()))
+            positive_magnitudes = positive_magnitudes[positive_magnitudes > 0]
+            color_min = positive_magnitudes.min()
+            color_max = max(positive_magnitudes.max(), color_min * 10)
+            feature_norm = LogNorm(vmin=color_min, vmax=color_max)
+            feature_cmap = "viridis"
 
-        fig, axes = plt.subplots(3, 2, figsize=(18, 12), constrained_layout=True)
-        raw_axis = axes[0, 0]
-        feature_axis = axes[1, 0]
-        delta_axis = axes[2, 0]
-        power_axis = axes[0, 1]
-        state_axis = axes[1, 1]
-        prediction_axis = axes[2, 1]
+            fig, axes = plt.subplots(3, 2, figsize=(18, 12), constrained_layout=True)
+            raw_axis = axes[0, 0]
+            feature_axis = axes[1, 0]
+            delta_axis = axes[2, 0]
+            power_axis = axes[0, 1]
+            state_axis = axes[1, 1]
+            prediction_axis = axes[2, 1]
 
-        raw_axis.plot(time_raw_test, X_raw_test[:, :, 0].reshape(-1), color="tab:blue", linewidth=0.3,
-                      rasterized=True, label="voltage")
-        current_axis = raw_axis.twinx()
-        current_axis.plot(time_raw_test, X_raw_test[:, :, 1].reshape(-1), color="tab:orange", linewidth=0.3,
-                          rasterized=True, label="current")
-        raw_axis.set(title="Raw Voltage and Current (Complete Test Set)", xlabel="Time (s)", ylabel="Voltage")
-        current_axis.set_ylabel("Current")
-        raw_axis.legend(loc="upper left")
-        current_axis.legend(loc="upper right")
+            raw_axis.plot(time_raw_test, X_raw_test[:, :, 0].reshape(-1), color="tab:blue", linewidth=0.3,
+                          rasterized=True, label="voltage")
+            current_axis = raw_axis.twinx()
+            current_axis.plot(time_raw_test, X_raw_test[:, :, 1].reshape(-1), color="tab:orange", linewidth=0.3,
+                              rasterized=True, label="current")
+            raw_axis.set(title="Raw Voltage and Current (Complete Test Set)", xlabel="Time (s)", ylabel="Voltage")
+            current_axis.set_ylabel("Current")
+            raw_axis.legend(loc="upper left")
+            current_axis.legend(loc="upper right")
 
-        feature_image = feature_axis.imshow(
-            feature_magnitudes.T,
-            aspect="auto",
-            origin="lower",
-            interpolation="nearest",
-            cmap=feature_cmap,
-            norm=feature_norm,
-            extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
-        )
-        feature_axis.set(title="Extracted Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
-        feature_axis.set_yticks(range(len(f_names)), f_names)
-        fig.colorbar(feature_image, ax=feature_axis, pad=0.01, label="Magnitude (log scale)")
+            feature_image = feature_axis.imshow(
+                feature_magnitudes.T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap=feature_cmap,
+                norm=feature_norm,
+                extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+            )
+            feature_axis.set(title="Extracted Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
+            feature_axis.set_yticks(range(len(f_names)), f_names)
+            fig.colorbar(feature_image, ax=feature_axis, pad=0.01, label="Magnitude (log scale)")
 
-        delta_image = delta_axis.imshow(
-            encoding_magnitudes.T,
-            aspect="auto",
-            origin="lower",
-            interpolation="nearest",
-            cmap=feature_cmap,
-            norm=feature_norm,
-            extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
-        )
-        delta_axis.set(title="SNN Input Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
-        delta_axis.set_yticks(range(len(f_names)), f_names)
-        fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
+            delta_image = delta_axis.imshow(
+                encoding_magnitudes.T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap=feature_cmap,
+                norm=feature_norm,
+                extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+            )
+            delta_axis.set(title="SNN Input Feature Magnitudes (Complete Test Set)", xlabel="Time (s)", ylabel="Feature")
+            delta_axis.set_yticks(range(len(f_names)), f_names)
+            fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
 
-        power_axis.plot(time_sequence_test, y_t_test, color="tab:green", linewidth=0.5, rasterized=True, label="power")
-        power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)", ylabel="Power (W)")
-        power_axis.legend(loc="upper right")
+            power_axis.plot(time_sequence_test, y_t_test[:, i], color="tab:green", linewidth=0.5, rasterized=True, label="power")
+            power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)", ylabel="Power (W)")
+            power_axis.legend(loc="upper right")
 
-        state_axis.step(time_sequence_test, s_t_test, where="post", color="tab:blue", linewidth=0.5,
-                        rasterized=True, label="ON/OFF state")
-        state_axis.step(time_sequence_test, ds_t_test, where="post", color="tab:orange", linewidth=0.5,
-                        rasterized=True, label="state change")
-        state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)", ylabel="State",
-                       ylim=(-0.1, 1.1))
-        state_axis.legend(loc="upper right")
+            state_axis.step(time_sequence_test, s_t_test[:, i], where="post", color="tab:blue", linewidth=0.5,
+                            rasterized=True, label="ON/OFF state")
+            state_axis.step(time_sequence_test, ds_t_test[:, i], where="post", color="tab:orange", linewidth=0.5,
+                            rasterized=True, label="state change")
+            state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)", ylabel="State",
+                           ylim=(-0.1, 1.1))
+            state_axis.legend(loc="upper right")
 
-        prediction_axis.step(time_sequence_pred, y_test_snn, where="post", color="tab:blue", linewidth=0.5,
-                             rasterized=True, label="target")
-        prediction_axis.step(time_sequence_pred, y_pred_snn, where="post", color="tab:red", linewidth=0.5,
-                             rasterized=True, label="prediction")
-        prediction_axis.plot(time_sequence_pred, y_prob_snn, color="tab:purple", linewidth=0.5, alpha=0.7,
-                             rasterized=True, label="membrane probability")
-        prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
-                            ylim=(-0.1, 1.1))
-        prediction_axis.legend(loc="upper right")
+            prediction_axis.step(time_sequence_pred, y_test_snn[:, i], where="post", color="tab:blue", linewidth=0.5,
+                                 rasterized=True, label="target")
+            prediction_axis.step(time_sequence_pred, y_pred_snn[:, i], where="post", color="tab:red", linewidth=0.5,
+                                 rasterized=True, label="prediction")
+            prediction_axis.plot(time_sequence_pred, y_prob_snn[:, i], color="tab:purple", linewidth=0.5, alpha=0.7,
+                                 rasterized=True, label="membrane probability")
+            prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
+                                ylim=(-0.1, 1.1))
+            prediction_axis.legend(loc="upper right")
 
-        fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][0]}.png", dpi=150)
-        plt.close(fig)
+            fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][i]}.png", dpi=150)
+            plt.close(fig)
 
 
 #######################################################################################################################

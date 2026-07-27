@@ -10,11 +10,11 @@ def build_config_default():
         # ── Dataset ──────────────────────────────────────────────────────────
         "NAME": "redd3HF",                                                      # Dataset name
         "T_SAMPLING": 3,                                                        # Sequence-frame sampling period (s)
-        "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID)
+        "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID), 999: all devices
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
-        "SPLIT_TRAIN": 0.80,                                                    # Fraction of samples used for training
+        "SPLIT_TRAIN": 0.99,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": 50000,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -42,13 +42,13 @@ def build_config_default():
         "NUM_WORKERS": 0,                                                       # DataLoader workers (keep 0 on Windows unless profiling suggests otherwise)
 
         # ── General Model Para  ──────────────────────────────────────────────
-        "WINDOW": 60,  # Number of AC cycles per input window
+        "WINDOW": 30,  # Number of AC cycles per input window
         "STRIDE": 1,  # Sliding-window stride used during training
 
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "SNN_MODE": "s2p",                                                    # Classifier type: 's2s' sequence to sequence | 's2p' = sequence to point
-        "SNN_HIDDEN_SIZE": 32,                                                      # Hidden layer width (neurons / channels)
+        "SNN_HIDDEN_SIZE": 16,                                                      # Hidden layer width (neurons / channels)
         "SNN_NUM_LAYERS": 2,                                                        # Number of stacked layers
         "SNN_BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
@@ -62,8 +62,12 @@ def build_config_default():
         "SNN_OFF_RATE": 0.0,                                                        # Target spike rate for OFF class  (spike loss mode)
         "SNN_BATCH_SIZE": 1024,                                                     # Mini-batch size for training
         "SNN_LR": 1e-3,                                                             # Learning rate for Adam optimiser
-        "SNN_EPOCHS": 50,                                                           # Number of training epochs
-        "SNN_PATIENCE": 5,                                                          # Number of training epochs without improvement
+        "SNN_LR_FACTOR": 0.5,
+        "SNN_LR_PATIENCE": 5,
+        "SNN_MIN_LR": 1e-6,
+        "SNN_GRAD_CLIP": 1.0,
+        "SNN_PATIENCE": 15,
+        "SNN_EPOCHS": 100,
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "mdl/best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
