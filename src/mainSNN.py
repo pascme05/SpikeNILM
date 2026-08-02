@@ -24,8 +24,6 @@ Non-Intrusive Load Monitoring (NILM) pipeline for the REDD high-frequency datase
 # Internal
 # ===============================================================================
 from auxFnc import (
-    SNNModel,
-    LSTMModel,
     balance_sequences,
     binarize_output,
     create_sequences,
@@ -34,14 +32,11 @@ from auxFnc import (
     feature_deltas,
     filter_output,
     load_data,
-    test_snn,
-    train_snn,
-    train_lstm,
-    test_lstm,
     check_hardware,
     evaluate_classification,
 )
 from config import build_config_default
+from traintestMdl import trainSNN, testSNN, trainDnn, testDnn, modelLSTM, modelSNN, modelDNN
 
 # ===============================================================================
 # External
@@ -211,15 +206,15 @@ def main(config):
     # ------------------------------------------
     # Input Selector
     # ------------------------------------------
-    # SNN
+    # CLA
     if config.get("SNN_INPUT_TRANSFORM", "delta") == "delta":
-        X_snn_train = dXf_t_train
-        X_snn_test = dXf_t_test
-        X_snn_val = dXf_t_val
+        X_cla_train = dXf_t_train
+        X_cla_test = dXf_t_test
+        X_cla_val = dXf_t_val
     elif config.get("SNN_INPUT_TRANSFORM") == "absolute":
-        X_snn_train = Xf_t_train
-        X_snn_test = Xf_t_test
-        X_snn_val = Xf_t_val
+        X_cla_train = Xf_t_train
+        X_cla_test = Xf_t_test
+        X_cla_val = Xf_t_val
     else:
         raise ValueError("SNN_INPUT_TRANSFORM must be 'delta' or 'absolute'.")
 
@@ -231,10 +226,10 @@ def main(config):
     # ------------------------------------------
     # Creat Targets
     # ------------------------------------------
-    # SNN
-    y_train_snn = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
-    y_val_snn = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
-    y_test_snn = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
+    # CLA
+    y_cla_train = ds_t_train if config["USE_DERIVATIVE"] else s_t_train
+    y_cla_val = ds_t_val if config["USE_DERIVATIVE"] else s_t_val
+    y_cla_test = ds_t_test if config["USE_DERIVATIVE"] else s_t_test
 
     # REG
     y_reg_train = y_t_train
@@ -244,65 +239,44 @@ def main(config):
     # ------------------------------------------
     # Windowing
     # ------------------------------------------
-    # SNN
-    X_snn_train, y_train_snn = create_sequences(X_snn_train, y_train_snn,
-                                                sequence_length=config["WINDOW"],
-                                                stride=config["STRIDE"],
-                                                mode=config["SNN_MODE"])
-    X_snn_val, y_val_snn = create_sequences(X_snn_val, y_val_snn,
-                                            sequence_length=config["WINDOW"],
-                                            stride=config["STRIDE"],
-                                            mode=config["SNN_MODE"])
+    # CLA
+    X_cla_train, y_cla_train = create_sequences(X_cla_train, y_cla_train, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
+    X_cla_val, y_cla_val = create_sequences(X_cla_val, y_cla_val, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
 
     if config["SNN_MODE"] == "s2s":
-        X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
-                                                  sequence_length=config["WINDOW"],
-                                                  stride=config["WINDOW"],
-                                                  mode=config["SNN_MODE"])
+        X_cla_test, y_cla_test = create_sequences(X_cla_test, y_cla_test, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
     else:
-        X_snn_test, y_test_snn = create_sequences(X_snn_test, y_test_snn,
-                                                  sequence_length=config["WINDOW"],
-                                                  stride=1,
-                                                  mode=config["SNN_MODE"])
+        X_cla_test, y_cla_test = create_sequences(X_cla_test, y_cla_test, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
 
     # REG
-    X_reg_train, y_reg_train = create_sequences(X_reg_train, y_reg_train,
-                                                sequence_length=config["WINDOW"],
-                                                stride=config["STRIDE"],
-                                                mode=config["SNN_MODE"])
-    X_reg_val, y_reg_val = create_sequences(X_reg_val, y_reg_val,
-                                            sequence_length=config["WINDOW"],
-                                            stride=config["STRIDE"],
-                                            mode=config["SNN_MODE"])
-    X_reg_test, y_reg_test = create_sequences(X_reg_test, y_reg_test,
-                                              sequence_length=config["WINDOW"],
-                                              stride=1,
-                                              mode=config["SNN_MODE"])
+    X_reg_train, y_reg_train = create_sequences(X_reg_train, y_reg_train, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
+    X_reg_val, y_reg_val = create_sequences(X_reg_val, y_reg_val, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
+    X_reg_test, y_reg_test = create_sequences(X_reg_test, y_reg_test, sequence_length=config["WINDOW"], stride=config["STRIDE"], mode=config["SNN_MODE"])
 
     # ------------------------------------------
     # Balance
     # ------------------------------------------
     if config["BALANCE_DATA"]:
-        num_pos = y_train_snn.sum()
-        num_neg = y_train_snn.size - num_pos
+        num_pos = y_cla_train.sum()
+        num_neg = y_cla_train.size - num_pos
         pos_weight = torch.tensor([num_neg / num_pos], device=device)
     else:
         pos_weight = torch.tensor([1 / 1], device=device)
-    print(f"Training sequences: {len(X_snn_train):,}; test sequences: {len(X_snn_test):,} ; "
-          f"validation sequences: {len(X_snn_val):,}")
+    print(f"Training sequences: {len(X_cla_train):,}; test sequences: {len(X_cla_test):,} ; "
+          f"validation sequences: {len(X_cla_val):,}")
 
     # ===============================================================================
-    # STAGE 3: SNN Classification
+    # STAGE 3: Classification
     # ===============================================================================
     # ------------------------------------------
     # Init
     # ------------------------------------------
     # Model
     if config["CLA_TYPE"] == "snn":
-        mdlCLA = SNNModel(input_size=X_snn_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+        mdlCLA = modelSNN(input_size=X_cla_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
                           num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
     else:
-        test = 1
+        mdlCLA = modelDNN(input_size=X_cla_train.shape[-1], sequence_length=config["WINDOW"], hidden_sizes=config["SNN_HIDDEN_SIZE"], output_size=C).to(device)
 
     # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlCLA.parameters(), lr=config["SNN_LR"])
@@ -313,39 +287,42 @@ def main(config):
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
         if config["CLA_TYPE"] == "snn":
-            mdlCLA = train_snn(mdlCLA, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
+            mdlCLA = trainSNN(mdlCLA, X_cla_train, y_cla_train, X_cla_val, y_cla_val, opt, loss_fn, config, device)
         else:
-            test = 1
+            mdlCLA = trainDnn(mdlCLA, X_cla_train, y_cla_train, X_cla_val, y_cla_val, opt, loss_fn, config, device, config["SNN_SAVE_PATH"], EPOCH=config["SNN_EPOCHS"], BATCH=config["SNN_BATCH_SIZE"], PATIENCE=config["SNN_LR_PATIENCE"])
 
     # -----------------------------------------
     # Inference
     # ------------------------------------------
+    # Calc
     if config["SNN_MODE"] == "s2s":
         if config["CLA_TYPE"] == "snn":
-            evaluation = test_snn(mdlCLA, X_snn_test, config, device, load_checkpoint=True)
+            evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
         else:
-            test = 1
+            evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
         y_pred_snn = evaluation["predictions"].reshape(-1, evaluation["predictions"].shape[-1])
-        y_test_snn = y_test_snn.reshape(-1, y_test_snn.shape[-1])
-        y_prob_snn = evaluation["probabilities"].reshape(-1, evaluation["probabilities"].shape[-1])
+        y_cla_pred = y_cla_test.reshape(-1, y_cla_test.shape[-1])
+        y_cla_prob = evaluation["probabilities"].reshape(-1, evaluation["probabilities"].shape[-1])
     else:
         if config["CLA_TYPE"] == "snn":
-            evaluation = test_snn(mdlCLA, X_snn_test, config, device, load_checkpoint=True)
+            evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
         else:
-            test = 1
-        y_pred_snn = evaluation["predictions"]
-        y_prob_snn = evaluation["probabilities"]
-    time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
+            evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
+        y_cla_pred = evaluation["predictions"]
+        y_cla_prob = evaluation["probabilities"]
+
+    # Time
+    time_sequence_pred = time_sequence_test[:len(y_cla_pred)]
 
     """
     # ===============================================================================
-    # STAGE 4: LSTM Regression
+    # STAGE 4: Regression
     # ===============================================================================
     # ------------------------------------------
     # Init
     # ------------------------------------------
     # Model
-    mdlREG = LSTMModel(input_size=X_reg_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
+    mdlREG = modelLSTM(input_size=X_reg_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
                        num_layers=config["REG_NUM_LAYERS"]).to(device)
 
     # Loss Fnc and Optimizer
@@ -356,12 +333,12 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["REG_DO_TRAIN"]:
-        mdlREG = train_lstm(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device)
+        mdlREG = trainDnn(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device)
 
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = test_lstm(mdlREG, X_reg_test, config, device, load_checkpoint=True)
+    evaluation = testDnn(mdlREG, X_reg_test, config, device, load_checkpoint=True)
     y_pred_snn = evaluation["predictions"]
     y_prob_snn = evaluation["probabilities"]
     time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
@@ -390,7 +367,7 @@ def main(config):
     # Calc Accuracy
     # ------------------------------------------
     # SNN Stage
-    metrics = evaluate_classification(y_test_snn, y_pred_snn)
+    metrics = evaluate_classification(y_cla_test, y_cla_pred)
 
     # RNN Stage
 
@@ -470,11 +447,11 @@ def main(config):
                            ylim=(-0.1, 1.1))
             state_axis.legend(loc="upper right")
 
-            prediction_axis.step(time_sequence_pred, y_test_snn[:, i], where="post", color="tab:blue", linewidth=0.5,
+            prediction_axis.step(time_sequence_pred, y_cla_test[:, i], where="post", color="tab:blue", linewidth=0.5,
                                  rasterized=True, label="target")
-            prediction_axis.step(time_sequence_pred, y_pred_snn[:, i], where="post", color="tab:red", linewidth=0.5,
+            prediction_axis.step(time_sequence_pred, y_cla_pred[:, i], where="post", color="tab:red", linewidth=0.5,
                                  rasterized=True, label="prediction")
-            prediction_axis.plot(time_sequence_pred, y_prob_snn[:, i], color="tab:purple", linewidth=0.5, alpha=0.7,
+            prediction_axis.plot(time_sequence_pred, y_cla_prob[:, i], color="tab:purple", linewidth=0.5, alpha=0.7,
                                  rasterized=True, label="membrane probability")
             prediction_axis.set(title="SNN Prediction (Resampled to Raw Time)", xlabel="Time (s)", ylabel="ON probability",
                                 ylim=(-0.1, 1.1))

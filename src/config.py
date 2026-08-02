@@ -14,7 +14,7 @@ def build_config_default():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.90,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": 50000,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -47,7 +47,7 @@ def build_config_default():
 
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
-        "CLA_TYPE": "dnn",  # Regressor architecture: 'dnn' | 'snn'
+        "CLA_TYPE": "snn",  # Regressor architecture: 'dnn' | 'snn'
         "SNN_MODE": "s2p",                                                    # Classifier type: 's2s' sequence to sequence | 's2p' = sequence to point
         "SNN_HIDDEN_SIZE": 16,                                                      # Hidden layer width (neurons / channels)
         "SNN_NUM_LAYERS": 2,                                                        # Number of stacked layers
@@ -68,7 +68,7 @@ def build_config_default():
         "SNN_MIN_LR": 1e-6,
         "SNN_GRAD_CLIP": 1.0,
         "SNN_PATIENCE": 15,
-        "SNN_EPOCHS": 100,
+        "SNN_EPOCHS": 10,
         "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "mdl/best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
