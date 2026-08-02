@@ -165,6 +165,9 @@ def trainDnn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device, PA
             y_hat = mdl(xb)
             loss = loss_fnc(y_hat, yb)
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(mdl.parameters(), max_norm=cfg.get("SNN_GRAD_CLIP", 1.0))
             opt.step()
             epoch_train_loss += loss.item() * xb.size(0)
 
@@ -189,7 +192,7 @@ def trainDnn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device, PA
         current_lr = opt.param_groups[0]["lr"]
 
         print(
-            f"SNN {epoch + 1:3d}/{EPOCH} | "
+            f"DNN {epoch + 1:3d}/{EPOCH} | "
             f"Train: {epoch_train_loss:.5f} | "
             f"Val: {epoch_val_loss:.5f} | "
             f"LR: {current_lr:.2e}"

@@ -47,6 +47,13 @@ from sklearn.metrics import (
     hamming_loss,
 )
 
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+    explained_variance_score,
+    mean_absolute_percentage_error,
+)
 
 #######################################################################################################################
 # General
@@ -366,7 +373,7 @@ def create_sequences(features, targets, sequence_length, stride=1, mode="s2p"):
 
 
 # ==============================================================================
-# FNC: SNN Testing Loop
+# FNC: Evaluate Classification
 # ==============================================================================
 def evaluate_classification(y_true, y_pred, verbose=True):
     """
@@ -435,6 +442,104 @@ def evaluate_classification(y_true, y_pred, verbose=True):
                 f"P={m['precision']:.4f}  "
                 f"R={m['recall']:.4f}  "
                 f"F1={m['f1']:.4f}"
+            )
+
+    metrics["devices"] = device_metrics
+
+    return metrics
+
+
+# ==============================================================================
+# FNC: Evaluate Regression
+# ==============================================================================
+def evaluate_regression(y_true, y_pred, verbose=True):
+    """
+    Evaluate a multi-output regression model.
+
+    Parameters
+    ----------
+    y_true : ndarray (N, C)
+        Ground truth values.
+    y_pred : ndarray (N, C)
+        Predicted values.
+    verbose : bool
+        Print metrics if True.
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary containing overall and per-device metrics.
+    """
+
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    metrics = {}
+
+    # ------------------------------------------------------------------
+    # Overall metrics
+    # ------------------------------------------------------------------
+    metrics["mae"] = mean_absolute_error(y_true, y_pred)
+    metrics["mse"] = mean_squared_error(y_true, y_pred)
+    metrics["rmse"] = np.sqrt(metrics["mse"])
+    metrics["r2"] = r2_score(y_true, y_pred, multioutput="uniform_average")
+    metrics["explained_variance"] = explained_variance_score(
+        y_true, y_pred, multioutput="uniform_average"
+    )
+
+    try:
+        metrics["mape"] = mean_absolute_percentage_error(y_true, y_pred)
+    except Exception:
+        metrics["mape"] = np.nan
+
+    if verbose:
+        print("\nOverall regression metrics")
+        print("-" * 45)
+        print(f"MAE                  : {metrics['mae']:.2f}")
+        print(f"MSE                  : {metrics['mse']:.2f}")
+        print(f"RMSE                 : {metrics['rmse']:.2f}")
+        print(f"R²                   : {metrics['r2']:.4f}")
+        print(f"Explained Variance   : {metrics['explained_variance']:.f}")
+        print(f"MAPE                 : {metrics['mape']:.4f}")
+
+    # ------------------------------------------------------------------
+    # Per-device metrics
+    # ------------------------------------------------------------------
+    device_metrics = []
+
+    if verbose:
+        print("\nPer-device metrics")
+        print("-" * 90)
+
+    for i in range(y_true.shape[1]):
+
+        m = {}
+
+        m["mae"] = mean_absolute_error(y_true[:, i], y_pred[:, i])
+        m["mse"] = mean_squared_error(y_true[:, i], y_pred[:, i])
+        m["rmse"] = np.sqrt(m["mse"])
+        m["r2"] = r2_score(y_true[:, i], y_pred[:, i])
+        m["explained_variance"] = explained_variance_score(
+            y_true[:, i], y_pred[:, i]
+        )
+
+        try:
+            m["mape"] = mean_absolute_percentage_error(
+                y_true[:, i], y_pred[:, i]
+            )
+        except Exception:
+            m["mape"] = np.nan
+
+        device_metrics.append(m)
+
+        if verbose:
+            print(
+                f"Device {i+1:2d}: "
+                f"MAE={m['mae']:.2f}  "
+                f"RMSE={m['rmse']:.2f}  "
+                f"R²={m['r2']:.4f}  "
+                f"EV={m['explained_variance']:.4f}  "
+                f"MAPE={m['mape']:.4f}"
             )
 
     metrics["devices"] = device_metrics

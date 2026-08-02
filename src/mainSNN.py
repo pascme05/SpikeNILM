@@ -24,7 +24,6 @@ Non-Intrusive Load Monitoring (NILM) pipeline for the REDD high-frequency datase
 # Internal
 # ===============================================================================
 from auxFnc import (
-    balance_sequences,
     binarize_output,
     create_sequences,
     downsample,
@@ -34,6 +33,7 @@ from auxFnc import (
     load_data,
     check_hardware,
     evaluate_classification,
+    evaluate_regression,
 )
 from config import build_config_default
 from traintestMdl import trainSNN, testSNN, trainDnn, testDnn, modelLSTM, modelSNN, modelDNN
@@ -274,9 +274,10 @@ def main(config):
     # Model
     if config["CLA_TYPE"] == "snn":
         mdlCLA = modelSNN(input_size=X_cla_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
-                          num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
+                          num_layers=config["SNN_NUM_LAYERS"], dropout=config["SNN_DROPOUT"], beta=config["SNN_BETA"]).to(device)
     else:
-        mdlCLA = modelDNN(input_size=X_cla_train.shape[-1], sequence_length=config["WINDOW"], hidden_sizes=config["SNN_HIDDEN_SIZE"], output_size=C).to(device)
+        mdlCLA = modelDNN(input_size=X_cla_train.shape[-1], sequence_length=config["WINDOW"], dropout=config["SNN_DROPOUT"],
+                          hidden_sizes=config["SNN_HIDDEN_SIZE"], output_size=C).to(device)
 
     # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlCLA.parameters(), lr=config["SNN_LR"])
@@ -289,7 +290,7 @@ def main(config):
         if config["CLA_TYPE"] == "snn":
             mdlCLA = trainSNN(mdlCLA, X_cla_train, y_cla_train, X_cla_val, y_cla_val, opt, loss_fn, config, device)
         else:
-            mdlCLA = trainDnn(mdlCLA, X_cla_train, y_cla_train, X_cla_val, y_cla_val, opt, loss_fn, config, device, config["SNN_SAVE_PATH"], EPOCH=config["SNN_EPOCHS"], BATCH=config["SNN_BATCH_SIZE"], PATIENCE=config["SNN_LR_PATIENCE"])
+            mdlCLA = trainDnn(mdlCLA, X_cla_train, y_cla_train, X_cla_val, y_cla_val, opt, loss_fn, config, device, config["SNN_SAVE_PATH"], EPOCH=config["SNN_EPOCHS"], BATCH=config["SNN_BATCH_SIZE"], PATIENCE=config["SNN_PATIENCE"])
 
     # -----------------------------------------
     # Inference
@@ -297,24 +298,23 @@ def main(config):
     # Calc
     if config["SNN_MODE"] == "s2s":
         if config["CLA_TYPE"] == "snn":
-            evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
+            cla_evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
         else:
-            evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
-        y_pred_snn = evaluation["predictions"].reshape(-1, evaluation["predictions"].shape[-1])
-        y_cla_pred = y_cla_test.reshape(-1, y_cla_test.shape[-1])
-        y_cla_prob = evaluation["probabilities"].reshape(-1, evaluation["probabilities"].shape[-1])
+            cla_evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
+        y_cla_pred = cla_evaluation["predictions"].reshape(-1, cla_evaluation["predictions"].shape[-1])
+        y_cla_pred = y_cla_pred.reshape(-1, y_cla_pred.shape[-1])
+        y_cla_prob = cla_evaluation["probabilities"].reshape(-1, cla_evaluation["probabilities"].shape[-1])
     else:
         if config["CLA_TYPE"] == "snn":
-            evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
+            cla_evaluation = testSNN(mdlCLA, X_cla_test, config, device, load_checkpoint=True)
         else:
-            evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
-        y_cla_pred = evaluation["predictions"]
-        y_cla_prob = evaluation["probabilities"]
+            cla_evaluation = testDnn(mdlCLA, X_cla_test, config, device, config["SNN_SAVE_PATH"], load_checkpoint=True)
+        y_cla_pred = cla_evaluation["predictions"]
+        y_cla_prob = cla_evaluation["probabilities"]
 
     # Time
     time_sequence_pred = time_sequence_test[:len(y_cla_pred)]
 
-    """
     # ===============================================================================
     # STAGE 4: Regression
     # ===============================================================================
@@ -323,7 +323,7 @@ def main(config):
     # ------------------------------------------
     # Model
     mdlREG = modelLSTM(input_size=X_reg_train.shape[-1], hidden_size=config["REG_HIDDEN_SIZE"], output_size=C,
-                       num_layers=config["REG_NUM_LAYERS"]).to(device)
+                       dropout=config["REG_DROPOUT"], num_layers=config["REG_NUM_LAYERS"]).to(device)
 
     # Loss Fnc and Optimizer
     opt = torch.optim.Adam(mdlREG.parameters(), lr=config["REG_LR"])
@@ -333,43 +333,34 @@ def main(config):
     # Train
     # ------------------------------------------
     if config["REG_DO_TRAIN"]:
-        mdlREG = trainDnn(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device)
+        mdlREG = trainDnn(mdlREG, X_reg_train, y_reg_train, X_reg_val, y_reg_val, opt, loss_fn, config, device,
+                          config["REG_SAVE_PATH"], EPOCH=config["REG_EPOCHS"], BATCH=config["REG_BATCH_SIZE"],
+                          PATIENCE=config["REG_PATIENCE"])
 
     # ------------------------------------------
     # Inference
     # ------------------------------------------
-    evaluation = testDnn(mdlREG, X_reg_test, config, device, load_checkpoint=True)
-    y_pred_snn = evaluation["predictions"]
-    y_prob_snn = evaluation["probabilities"]
-    time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
-    """
+    reg_evaluation = testDnn(mdlREG, X_reg_test, config, device, config["REG_SAVE_PATH"], load_checkpoint=True)
+    y_reg_pred, y_reg_prob = reg_evaluation["logits"], reg_evaluation["predictions"]
+    time_sequence_pred = time_sequence_test[:len(y_reg_pred)]
 
     # ===============================================================================
     # STAGE 5: Prediction and Accuracy
     # ===============================================================================
     # ------------------------------------------
-    # Init
-    # ------------------------------------------
-
-    # ------------------------------------------
-    # Load Model
-    # ------------------------------------------
-
-    # ------------------------------------------
-    # Inference
-    # ------------------------------------------
-
-    # ------------------------------------------
     # De-Normalization
     # ------------------------------------------
+    y_reg_pred = y_reg_pred * config["Scale"] + ymin
+    y_reg_test = y_reg_test * config["Scale"] + ymin
 
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    # SNN Stage
-    metrics = evaluate_classification(y_cla_test, y_cla_pred)
+    # CLA Stage
+    cla_metrics = evaluate_classification(y_cla_test, y_cla_pred)
 
-    # RNN Stage
+    # REG Stage
+    reg_metrics = evaluate_regression(y_reg_test, y_reg_pred, verbose=True)
 
     # ===============================================================================
     # STAGE 6: Plotting
@@ -458,6 +449,99 @@ def main(config):
             prediction_axis.legend(loc="upper right")
 
             fig.savefig(output_dir / f"snn_predictions_dev{config['DEVICE_IDS'][i]}.png", dpi=150)
+            plt.close(fig)
+
+    # ------------------------------------------
+    # REG
+    # ------------------------------------------
+    if config["PLOT_REG"]:
+        for i in range(0, C):
+            output_dir = project_root / "results"
+            output_dir.mkdir(exist_ok=True)
+
+            feature_magnitudes = np.abs(Xf_t_test)
+            encoding_magnitudes = np.abs(dXf_t_test)
+            positive_magnitudes = np.concatenate((feature_magnitudes.ravel(), encoding_magnitudes.ravel()))
+            positive_magnitudes = positive_magnitudes[positive_magnitudes > 0]
+            color_min = positive_magnitudes.min()
+            color_max = max(positive_magnitudes.max(), color_min * 10)
+            feature_norm = LogNorm(vmin=color_min, vmax=color_max)
+            feature_cmap = "viridis"
+
+            fig, axes = plt.subplots(3, 2, figsize=(18, 12), constrained_layout=True)
+            raw_axis = axes[0, 0]
+            feature_axis = axes[1, 0]
+            delta_axis = axes[2, 0]
+            power_axis = axes[0, 1]
+            state_axis = axes[1, 1]
+            prediction_axis = axes[2, 1]
+
+            raw_axis.plot(time_raw_test, X_raw_test[:, :, 0].reshape(-1), color="tab:blue", linewidth=0.3,
+                          rasterized=True, label="voltage")
+            current_axis = raw_axis.twinx()
+            current_axis.plot(time_raw_test, X_raw_test[:, :, 1].reshape(-1), color="tab:orange", linewidth=0.3,
+                              rasterized=True, label="current")
+            raw_axis.set(title="Raw Voltage and Current (Complete Test Set)", xlabel="Time (s)",
+                         ylabel="Voltage")
+            current_axis.set_ylabel("Current")
+            raw_axis.legend(loc="upper left")
+            current_axis.legend(loc="upper right")
+
+            feature_image = feature_axis.imshow(
+                feature_magnitudes.T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap=feature_cmap,
+                norm=feature_norm,
+                extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+            )
+            feature_axis.set(title="Extracted Feature Magnitudes (Complete Test Set)", xlabel="Time (s)",
+                             ylabel="Feature")
+            feature_axis.set_yticks(range(len(f_names)), f_names)
+            fig.colorbar(feature_image, ax=feature_axis, pad=0.01, label="Magnitude (log scale)")
+
+            delta_image = delta_axis.imshow(
+                encoding_magnitudes.T,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                cmap=feature_cmap,
+                norm=feature_norm,
+                extent=(time_sequence_test[0], time_sequence_test[-1], -0.5, len(f_names) - 0.5),
+            )
+            delta_axis.set(title="REG Input Feature Magnitudes (Complete Test Set)", xlabel="Time (s)",
+                           ylabel="Feature")
+            delta_axis.set_yticks(range(len(f_names)), f_names)
+            fig.colorbar(delta_image, ax=delta_axis, pad=0.01, label="Magnitude (log scale)")
+
+            power_axis.plot(time_sequence_test, y_t_test[:, i], color="tab:green", linewidth=0.5,
+                            rasterized=True, label="power")
+            power_axis.set(title="Filtered Appliance Power (Resampled to Raw Time)", xlabel="Time (s)",
+                           ylabel="Power (W)")
+            power_axis.legend(loc="upper right")
+
+            state_axis.step(time_sequence_test, s_t_test[:, i], where="post", color="tab:blue", linewidth=0.5,
+                            rasterized=True, label="ON/OFF state")
+            state_axis.step(time_sequence_test, ds_t_test[:, i], where="post", color="tab:orange",
+                            linewidth=0.5,
+                            rasterized=True, label="state change")
+            state_axis.set(title="Binary State and State Change (Resampled to Raw Time)", xlabel="Time (s)",
+                           ylabel="State",
+                           ylim=(-0.1, 1.1))
+            state_axis.legend(loc="upper right")
+
+            prediction_axis.step(time_sequence_pred, y_reg_test[:, i], where="post", color="tab:blue",
+                                 linewidth=0.5,
+                                 rasterized=True, label="target")
+            prediction_axis.step(time_sequence_pred, y_reg_pred[:, i], where="post", color="tab:red",
+                                 linewidth=0.5,
+                                 rasterized=True, label="prediction")
+            prediction_axis.set(title="REG Prediction (Resampled to Raw Time)", xlabel="Time (s)",
+                                ylabel="Power (W)")
+            prediction_axis.legend(loc="upper right")
+
+            fig.savefig(output_dir / f"reg_predictions_dev{config['DEVICE_IDS'][i]}.png", dpi=150)
             plt.close(fig)
 
 

@@ -14,7 +14,7 @@ def build_config_default():
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
         "SPLIT_TRAIN": 0.90,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
-        "MAX_LEN": 50000,                                                          # Max AC cycles to load  (-1 = full dataset)
+        "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
         "USE_FEATURES": True,                                                   # True = FFT features;  False = flattened raw waveform
         "REG_FEATURE_SELECTOR": {
@@ -49,11 +49,11 @@ def build_config_default():
         # ── SNN / Classifier ─────────────────────────────────────────────────
         "CLA_TYPE": "snn",  # Regressor architecture: 'dnn' | 'snn'
         "SNN_MODE": "s2p",                                                    # Classifier type: 's2s' sequence to sequence | 's2p' = sequence to point
-        "SNN_HIDDEN_SIZE": 16,                                                      # Hidden layer width (neurons / channels)
-        "SNN_NUM_LAYERS": 2,                                                        # Number of stacked layers
+        "SNN_HIDDEN_SIZE": 128,                                                      # Hidden layer width (neurons / channels)
+        "SNN_NUM_LAYERS": 3,                                                        # Number of stacked layers
         "SNN_BETA": 0.95,                                                           # Initial LIF membrane decay factor  (SNN only)
         "SNN_KERNEL_SIZE": 5,                                                       # Convolutional kernel size           (CNN only)
-        "SNN_DROPOUT": 0.2,                                                         # Dropout probability                 (LSTM only)
+        "SNN_DROPOUT": 0.0,                                                         # Dropout probability                 (LSTM only)
         "SNN_CODING": "raw",                                                        # Spike encoding: 'raw'|'rate'|'latency'|'delta'
         "SNN_INPUT_TRANSFORM": "absolute",                                         # 'delta' = consecutive-frame change signal, 'absolute' = original feature levels
         "SNN_DELTA_MODE": "absolute",                                           # 'absolute' = magnitude of change, 'signed' = signed change
@@ -68,8 +68,8 @@ def build_config_default():
         "SNN_MIN_LR": 1e-6,
         "SNN_GRAD_CLIP": 1.0,
         "SNN_PATIENCE": 15,
-        "SNN_EPOCHS": 10,
-        "SNN_DO_TRAIN": True,                                                       # True = train;  False = load from checkpoint
+        "SNN_EPOCHS": 100,
+        "SNN_DO_TRAIN": False,                                                       # True = train;  False = load from checkpoint
         "SNN_SAVE_PATH": "mdl/best_snn_dev{device_id}.pt",                 # One checkpoint per device
 
         # ── Optuna hyper-parameter search ─────────────────────────────────────
@@ -84,6 +84,7 @@ def build_config_default():
         "REG_EPOCHS": 100,                                                # Number of training epochs for the regressor
         "REG_BATCH_SIZE": 256,                                                    # Mini-batch size for training the regressor
         "REG_LR": 1e-3,                                                   # Learning rate for the regressor
+        "REG_PATIENCE": 15,
         "REG_HIDDEN_SIZE": 64,                                                  # Hidden layer width for the regressor
         "REG_NUM_LAYERS": 2,                                                    # Number of stacked layers for the regressor
         "REG_DROPOUT": 0.2,                                                     # Dropout probability for the regressor (LSTM only)
@@ -92,7 +93,7 @@ def build_config_default():
 
         # ── Plotting ──────────────────────────────────────────────────────────
         # Disable plots during automated runs (e.g. Optuna sweeps) to save time.
-        "PLOT_SNN": True,                                                       # Generate per-device SNN classification plots
+        "PLOT_SNN": False,                                                       # Generate per-device SNN classification plots
         "PLOT_REG": True,                                                # Generate per-device regression plots
         "PLOT_DEBUG_BATCH": True,                                              # Plot the first test batch input/output for model debugging
         "DEBUG_SAMPLE_INDEX": 0,                                                # Sample index inside the debug batch used for detailed views
