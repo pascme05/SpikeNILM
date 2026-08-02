@@ -10,9 +10,9 @@ def build_config_default():
         # ── Dataset ──────────────────────────────────────────────────────────
         "NAME": "redd3HF",                                                      # Dataset name
         "T_SAMPLING": 3,                                                        # Sequence-frame sampling period (s)
-        "DEVICE_IDS": [5],                                                      # Appliance device IDs to model (one SNN per ID), 999: all devices
+        "DEVICE_IDS": [5, 7, 8, 11, 13],                                                      # Appliance device IDs to model (one SNN per ID), 999: all devices
         "THRESHOLD": 50,                                                        # Power threshold (W) separating ON from OFF state
-        "SPLIT_TRAIN": 0.99,                                                    # Fraction of samples used for training
+        "SPLIT_TRAIN": 0.90,                                                    # Fraction of samples used for training
         "SPLIT_VAL": 0.10,                                                      # Fraction of samples used for validation
         "MAX_LEN": -1,                                                          # Max AC cycles to load  (-1 = full dataset)
         "N_HARMONICS": 9,                                                       # FFT harmonics extracted per voltage/current channel
@@ -47,6 +47,7 @@ def build_config_default():
 
 
         # ── SNN / Classifier ─────────────────────────────────────────────────
+        "CLA_TYPE": "dnn",  # Regressor architecture: 'dnn' | 'snn'
         "SNN_MODE": "s2p",                                                    # Classifier type: 's2s' sequence to sequence | 's2p' = sequence to point
         "SNN_HIDDEN_SIZE": 16,                                                      # Hidden layer width (neurons / channels)
         "SNN_NUM_LAYERS": 2,                                                        # Number of stacked layers

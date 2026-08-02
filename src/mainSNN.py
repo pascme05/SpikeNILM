@@ -39,6 +39,7 @@ from auxFnc import (
     train_lstm,
     test_lstm,
     check_hardware,
+    evaluate_classification,
 )
 from config import build_config_default
 
@@ -102,7 +103,10 @@ def main(config):
     # ------------------------------------------
     # Load Raw data
     # ------------------------------------------
+    # Loading
     X_raw, y_raw = load_data(data_path, config["DEVICE_IDS"], maxLen=config["MAX_LEN"])
+
+    # Variables
     N = X_raw.shape[0]  # Samples
     W = X_raw.shape[1]  # Window size
     F = X_raw.shape[2]  # Features
@@ -294,29 +298,41 @@ def main(config):
     # Init
     # ------------------------------------------
     # Model
-    mdlSNN = SNNModel(input_size=X_snn_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
-                      num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
+    if config["CLA_TYPE"] == "snn":
+        mdlCLA = SNNModel(input_size=X_snn_train.shape[-1], hidden_size=config["SNN_HIDDEN_SIZE"], output_size=C,
+                          num_layers=config["SNN_NUM_LAYERS"], beta=config["SNN_BETA"]).to(device)
+    else:
+        test = 1
 
     # Loss Fnc and Optimizer
-    opt = torch.optim.Adam(mdlSNN.parameters(), lr=config["SNN_LR"])
+    opt = torch.optim.Adam(mdlCLA.parameters(), lr=config["SNN_LR"])
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     # ------------------------------------------
     # Train
     # ------------------------------------------
     if config["SNN_DO_TRAIN"]:
-        mdlSNN = train_snn(mdlSNN, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
+        if config["CLA_TYPE"] == "snn":
+            mdlCLA = train_snn(mdlCLA, X_snn_train, y_train_snn, X_snn_val, y_val_snn, opt, loss_fn, config, device)
+        else:
+            test = 1
 
     # -----------------------------------------
     # Inference
     # ------------------------------------------
     if config["SNN_MODE"] == "s2s":
-        evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
+        if config["CLA_TYPE"] == "snn":
+            evaluation = test_snn(mdlCLA, X_snn_test, config, device, load_checkpoint=True)
+        else:
+            test = 1
         y_pred_snn = evaluation["predictions"].reshape(-1, evaluation["predictions"].shape[-1])
         y_test_snn = y_test_snn.reshape(-1, y_test_snn.shape[-1])
         y_prob_snn = evaluation["probabilities"].reshape(-1, evaluation["probabilities"].shape[-1])
     else:
-        evaluation = test_snn(mdlSNN, X_snn_test, config, device, load_checkpoint=True)
+        if config["CLA_TYPE"] == "snn":
+            evaluation = test_snn(mdlCLA, X_snn_test, config, device, load_checkpoint=True)
+        else:
+            test = 1
         y_pred_snn = evaluation["predictions"]
         y_prob_snn = evaluation["probabilities"]
     time_sequence_pred = time_sequence_test[:len(y_pred_snn)]
@@ -373,11 +389,10 @@ def main(config):
     # ------------------------------------------
     # Calc Accuracy
     # ------------------------------------------
-    ACC_Device = (y_pred_snn == y_test_snn.astype(int)).mean(axis=0)
-    ACC_Total = float((y_pred_snn == y_test_snn.astype(int)).mean())
-    print(f"Testing accuracy total: {ACC_Total:.4f}")
-    for i, acc in enumerate(ACC_Device):
-        print(f"Device {i + 1}: {acc:.4f}")
+    # SNN Stage
+    metrics = evaluate_classification(y_test_snn, y_pred_snn)
+
+    # RNN Stage
 
     # ===============================================================================
     # STAGE 6: Plotting

@@ -42,6 +42,14 @@ try:
 except ImportError:
     spikegen = None
 
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    hamming_loss,
+)
 
 #######################################################################################################################
 # General
@@ -344,22 +352,14 @@ def create_sequences(features, targets, sequence_length, stride=1, mode="s2p"):
         raise ValueError("stride must be at least 1.")
 
     # Input windows
-    X = np.lib.stride_tricks.sliding_window_view(
-        features,
-        window_shape=sequence_length,
-        axis=0,
-    )
+    X = np.lib.stride_tricks.sliding_window_view(features, window_shape=sequence_length, axis=0)
     X = np.moveaxis(X, -1, 1)[::stride].copy()
 
     if mode.lower() == "s2p":
         y = targets[sequence_length - 1::stride].copy()
 
     elif mode.lower() == "s2s":
-        y = np.lib.stride_tricks.sliding_window_view(
-            targets,
-            window_shape=sequence_length,
-            axis=0,
-        )
+        y = np.lib.stride_tricks.sliding_window_view(targets, window_shape=sequence_length, axis=0)
         y = np.moveaxis(y, -1, 1)[::stride].copy()
 
     else:
@@ -390,15 +390,7 @@ def get_logits(mem_rec, mode):
 # SNN Model
 # ==============================================================================
 class SNNModel(nn.Module):
-    def __init__(
-        self,
-        input_size,
-        hidden_size,
-        output_size,
-        num_layers=2,
-        beta=0.95,
-        dropout=0.2,
-    ):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2, beta=0.95, dropout=0.2):
         super().__init__()
 
         if num_layers < 1:
@@ -411,87 +403,40 @@ class SNNModel(nn.Module):
         in_features = input_size
 
         for _ in range(num_layers):
-
-            self.hidden_layers.append(
-                nn.Sequential(
-                    nn.Linear(in_features, hidden_size),
-                    nn.LayerNorm(hidden_size),
-                )
-            )
-
-            self.hidden_lifs.append(
-                snn.Leaky(
-                    beta=beta,
-                    spike_grad=surrogate.fast_sigmoid(),
-                )
-            )
-
-            self.dropouts.append(
-                nn.Dropout(dropout)
-            )
-
+            self.hidden_layers.append(nn.Sequential(nn.Linear(in_features, hidden_size), nn.LayerNorm(hidden_size)))
+            self.hidden_lifs.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid()))
+            self.dropouts.append(nn.Dropout(dropout))
             in_features = hidden_size
 
         # Residual classifier
-        self.output_layer = nn.Sequential(
-            nn.Linear(hidden_size + input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_size),
-        )
+        self.output_layer = nn.Sequential(nn.Linear(hidden_size + input_size, hidden_size), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_size, output_size))
 
     def forward(self, x):
 
         if x.ndim != 3:
-            raise ValueError(
-                "Input must be [batch, sequence, features]"
-            )
+            raise ValueError("Input must be [batch, sequence, features]")
 
-        hidden_memories = [
-            lif.init_leaky()
-            for lif in self.hidden_lifs
-        ]
-
+        hidden_memories = [lif.init_leaky() for lif in self.hidden_lifs]
         outputs = []
-
         T = x.shape[1]
 
         for t in range(T):
-
             # Current FFT
             current_input = x[:, t]
-
             activations = current_input
 
-            for i, (layer, lif, dropout) in enumerate(
-                zip(
-                    self.hidden_layers,
-                    self.hidden_lifs,
-                    self.dropouts,
-                )
-            ):
-
+            for i, (layer, lif, dropout) in enumerate(zip(self.hidden_layers, self.hidden_lifs, self.dropouts)):
                 current = layer(activations)
-
-                spikes, hidden_memories[i] = lif(
-                    current,
-                    hidden_memories[i],
-                )
-
-                # Use membrane potential
+                spikes, hidden_memories[i] = lif(current, hidden_memories[i])
                 activations = dropout(hidden_memories[i])
 
             # Residual connection
-            classifier_input = torch.cat(
-                [activations, current_input],
-                dim=1,
-            )
-
+            classifier_input = torch.cat([activations, current_input], dim=1,)
             logits = self.output_layer(classifier_input)
-
             outputs.append(logits)
 
         return torch.stack(outputs, dim=1)
+
 
 # ==============================================================================
 # Spike Encoding
@@ -519,7 +464,6 @@ def encode(X, coding):
 # FNC: SNN Training Loop
 # ==============================================================================
 def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
-
     # ------------------------------------------
     # Init
     # ------------------------------------------
@@ -532,22 +476,11 @@ def train_snn(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
     # ------------------------------------------
     # Data
     # ------------------------------------------
-    snn_train_dataset = TensorDataset(
-        torch.as_tensor(X_train, dtype=torch.float32),
-        torch.as_tensor(y_train, dtype=torch.float32),
-    )
-    snn_val_dataset = TensorDataset(
-        torch.as_tensor(X_val, dtype=torch.float32),
-        torch.as_tensor(y_val, dtype=torch.float32),
-    )
-    loader_kwargs = {
-        "batch_size": cfg["SNN_BATCH_SIZE"],
-        "num_workers": cfg.get("NUM_WORKERS", 0),
-        "pin_memory": device.type == "cuda",
-    }
-
+    snn_train_dataset = TensorDataset(torch.as_tensor(X_train, dtype=torch.float32), torch.as_tensor(y_train, dtype=torch.float32))
+    snn_val_dataset = TensorDataset(torch.as_tensor(X_val, dtype=torch.float32), torch.as_tensor(y_val, dtype=torch.float32))
+    loader_kwargs = {"batch_size": cfg["SNN_BATCH_SIZE"], "num_workers": cfg.get("NUM_WORKERS", 0), "pin_memory": device.type == "cuda"}
     snn_train_loader = DataLoader(snn_train_dataset, shuffle=True, **loader_kwargs)
-    snn_val_loader = DataLoader(snn_val_dataset, shuffle=False, **loader_kwargs,)
+    snn_val_loader = DataLoader(snn_val_dataset, shuffle=False, **loader_kwargs)
 
     # ------------------------------------------
     # Learning Rate Scheduler
@@ -665,11 +598,7 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
         if not os.path.exists(cfg["SNN_SAVE_PATH"]):
             raise FileNotFoundError(f"Missing SNN checkpoint: {cfg['SNN_SAVE_PATH']}")
 
-        checkpoint = torch.load(
-            cfg["SNN_SAVE_PATH"],
-            map_location=device,
-            weights_only=False,
-        )
+        checkpoint = torch.load(cfg["SNN_SAVE_PATH"], map_location=device, weights_only=False)
         mdl.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded SNN checkpoint from {cfg['SNN_SAVE_PATH']}")
 
@@ -679,19 +608,10 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
     mdl.eval()
 
     with torch.no_grad():
-
-        X_test = torch.as_tensor(
-            X_test,
-            dtype=torch.float32,
-            device=device,
-        )
-
+        X_test = torch.as_tensor(X_test, dtype=torch.float32, device=device)
         logits = mdl(encode(X_test, cfg["SNN_CODING"]))
-
         logits = get_logits(logits, cfg["SNN_MODE"])
-
         probabilities = torch.sigmoid(logits)
-
         predictions = (probabilities >= 0.5).to(torch.int64)
 
     return {
@@ -701,6 +621,83 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
     }
 
 
+# ==============================================================================
+# FNC: SNN Testing Loop
+# ==============================================================================
+def evaluate_classification(y_true, y_pred, verbose=True):
+    """
+    Evaluate a multi-label binary classification model.
+
+    Parameters
+    ----------
+    y_true : ndarray (N, C)
+        Ground truth labels.
+    y_pred : ndarray (N, C)
+        Predicted binary labels.
+    verbose : bool
+        Print metrics if True.
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary containing overall and per-device metrics.
+    """
+
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    metrics = {}
+
+    # Overall metrics
+    metrics["accuracy"] = accuracy_score(y_true.flatten(), y_pred.flatten())
+    metrics["precision"] = precision_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    metrics["recall"] = recall_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    metrics["f1"] = f1_score(y_true.flatten(), y_pred.flatten(), zero_division=0)
+    metrics["hamming_loss"] = hamming_loss(y_true, y_pred)
+    metrics["exact_match"] = (y_true == y_pred).all(axis=1).mean()
+
+    if verbose:
+        print("\nOverall classification metrics")
+        print("-" * 40)
+        print(f"Accuracy        : {metrics['accuracy']:.4f}")
+        print(f"Precision       : {metrics['precision']:.4f}")
+        print(f"Recall          : {metrics['recall']:.4f}")
+        print(f"F1-score        : {metrics['f1']:.4f}")
+        print(f"Hamming Loss    : {metrics['hamming_loss']:.4f}")
+        print(f"Exact Match     : {metrics['exact_match']:.4f}")
+
+    # Per-device metrics
+    device_metrics = []
+
+    if verbose:
+        print("\nPer-device metrics")
+        print("-" * 75)
+
+    for i in range(y_true.shape[1]):
+        m = {
+            "accuracy": accuracy_score(y_true[:, i], y_pred[:, i]),
+            "balanced_accuracy": balanced_accuracy_score(y_true[:, i], y_pred[:, i]),
+            "precision": precision_score(y_true[:, i], y_pred[:, i], zero_division=0),
+            "recall": recall_score(y_true[:, i], y_pred[:, i], zero_division=0),
+            "f1": f1_score(y_true[:, i], y_pred[:, i], zero_division=0),
+        }
+
+        device_metrics.append(m)
+
+        if verbose:
+            print(
+                f"Device {i+1:2d}: "
+                f"ACC={m['accuracy']:.4f}  "
+                f"BAL_ACC={m['balanced_accuracy']:.4f}  "
+                f"P={m['precision']:.4f}  "
+                f"R={m['recall']:.4f}  "
+                f"F1={m['f1']:.4f}"
+            )
+
+    metrics["devices"] = device_metrics
+
+    return metrics
+
+
 #######################################################################################################################
 # Regression Functions
 #######################################################################################################################
@@ -708,35 +705,18 @@ def test_snn(mdl, X_test, cfg, device, load_checkpoint=True):
 # FNC: LSTM Model
 # ==============================================================================
 class LSTMModel(nn.Module):
-    def __init__(
-        self,
-        input_size,
-        hidden_size,
-        output_size,
-        num_layers=1,
-        dropout=0.2,
-        output_mode="s2p",
-    ):
+    def __init__(self,input_size, hidden_size, output_size, num_layers=1, dropout=0.2, output_mode="s2p"):
         super().__init__()
 
         self.output_mode = output_mode.lower()
-
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0)
         self.output_layer = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
 
         if x.ndim != 3:
-            raise ValueError(
-                "Input must have shape (batch, sequence, features)."
-            )
+            raise ValueError("Input must have shape (batch, sequence, features).")
 
         # outputs: (batch, seq, hidden)
         outputs, _ = self.lstm(x)
@@ -774,19 +754,15 @@ def train_lstm(mdl, X_train, y_train, X_val, y_val, opt, loss_fnc, cfg, device):
     # ------------------------------------------
     # Data Prep
     # ------------------------------------------
-    train_dataset = TensorDataset(
-        torch.as_tensor(X_train, dtype=torch.float32),
-        torch.as_tensor(y_train, dtype=torch.float32),
-    )
-    val_dataset = TensorDataset(
-        torch.as_tensor(X_val, dtype=torch.float32),
-        torch.as_tensor(y_val, dtype=torch.float32),
-    )
+    train_dataset = TensorDataset(torch.as_tensor(X_train, dtype=torch.float32), torch.as_tensor(y_train, dtype=torch.float32))
+    val_dataset = TensorDataset(torch.as_tensor(X_val, dtype=torch.float32), torch.as_tensor(y_val, dtype=torch.float32))
+
     loader_kwargs = {
         "batch_size": cfg["REG_BATCH_SIZE"],
         "num_workers": cfg.get("NUM_WORKERS", 0),
         "pin_memory": device.type == "cuda",
     }
+
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
@@ -869,11 +845,7 @@ def test_lstm(mdl, X_test, cfg, device, load_checkpoint=True):
         if not os.path.exists(cfg["REG_SAVE_PATH"]):
             raise FileNotFoundError(f"Missing REG checkpoint: {cfg['REG_SAVE_PATH']}")
 
-        checkpoint = torch.load(
-            cfg["REG_SAVE_PATH"],
-            map_location=device,
-            weights_only=False,
-        )
+        checkpoint = torch.load(cfg["REG_SAVE_PATH"], map_location=device, weights_only=False)
         mdl.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded REG checkpoint from {cfg['REG_SAVE_PATH']}")
 
@@ -884,12 +856,7 @@ def test_lstm(mdl, X_test, cfg, device, load_checkpoint=True):
 
     with torch.no_grad():
 
-        X_test = torch.as_tensor(
-            X_test,
-            dtype=torch.float32,
-            device=device,
-        )
-
+        X_test = torch.as_tensor(X_test, dtype=torch.float32, device=device)
         y_hat = mdl(X_test)
 
         threshold = float(np.asarray(cfg["THRESHOLD"]).squeeze())
